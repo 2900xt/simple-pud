@@ -1,0 +1,7 @@
+flask
+mss
+opencv-python
+numpy
+pytesseract
+sqlalchemy
+requests
