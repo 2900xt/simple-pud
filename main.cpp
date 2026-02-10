@@ -5,4 +5,5 @@ int main() {
   initialize_solver();
   poker_game_state game;
   initialize_game(&game);
+  play_game(&game);
 }
