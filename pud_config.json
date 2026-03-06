@@ -1,0 +1,88 @@
+{
+  "table": [
+    220,
+    172,
+    920,
+    635
+  ],
+  "hero_cards": [
+    387,
+    381,
+    129,
+    51
+  ],
+  "board": [
+    304,
+    198,
+    312,
+    129
+  ],
+  "pot": [
+    306,
+    243,
+    302,
+    83
+  ],
+  "hero_stack": [
+    390,
+    463,
+    99,
+    27
+  ],
+  "hero_bet": [
+    414,
+    346,
+    104,
+    55
+  ],
+  "hero_button": [
+    392,
+    371,
+    49,
+    39
+  ],
+  "big_blind": 1.0,
+  "seats": [
+    {
+      "stack": null,
+      "bet": null,
+      "button": null
+    },
+    {
+      "stack": null,
+      "bet": null,
+      "button": null
+    },
+    {
+      "stack": null,
+      "bet": null,
+      "button": null
+    },
+    {
+      "stack": null,
+      "bet": null,
+      "button": null
+    },
+    {
+      "stack": null,
+      "bet": null,
+      "button": null
+    },
+    {
+      "stack": null,
+      "bet": null,
+      "button": null
+    },
+    {
+      "stack": null,
+      "bet": null,
+      "button": null
+    },
+    {
+      "stack": null,
+      "bet": null,
+      "button": null
+    }
+  ],
+  "hero_position": "BTN"
+}

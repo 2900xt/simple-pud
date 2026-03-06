@@ -1,309 +1,330 @@
-#!/usr/bin/env python3
 """
-Poker Screen Parser - Screenshots the game and parses board state via Claude Vision.
+Screen parser for PUD - extracts poker game state from screenshots.
+Uses OCR (pytesseract) for text + color analysis for card suits. No LLM needed.
 
-Usage:
-    ANTHROPIC_API_KEY=sk-... python3 tools/screen_parser.py [--region] [--key KEY]
-
-Modes:
-    Default:   Press Enter in terminal to capture
-    --region:  Use slurp to select a screen region (first capture only, reused after)
-    --key KEY: Global hotkey via evdev (e.g. --key PAUSE, --key F12). Needs input group.
-
-Requires: grim, ANTHROPIC_API_KEY env var
-Optional: slurp (for --region), evdev (for --key)
+All region coordinates in config are relative to the cropped table image.
+Region format: [x, y, w, h]
 """
 
-import argparse
-import base64
 import json
 import os
-import subprocess
-import sys
-import tempfile
-import time
+import re
 
-import requests
+from PIL import Image
 
-from advisor import analyze, print_analysis
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
 
-API_URL = "https://api.anthropic.com/v1/messages"
-MODEL = "claude-sonnet-4-20250514"
-SCREENSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "screenshots")
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pud_config.json")
 
-PARSE_PROMPT = """Analyze this poker game screenshot. Extract the board state as JSON with these fields:
-
-{
-  "community_cards": ["Ah", "Kd", "5c"],   // cards on the board, empty if preflop
-  "hero_hand": ["As", "Ks"],               // hero's hole cards if visible
-  "pot": 150,                                // pot size if visible, null otherwise
-  "stage": "flop",                           // preflop/flop/turn/river
-  "players": [                               // visible player info
-    {"position": "BTN", "stack": 200, "bet": 0, "folded": false}
-  ],
-  "current_bet": 10,                         // current bet to call, null if unknown
-  "notes": "any other relevant observations"
+RANK_MAP = {
+    "10": "T",
+    "2": "2", "3": "3", "4": "4", "5": "5", "6": "6",
+    "7": "7", "8": "8", "9": "9",
+    "T": "T", "J": "J", "Q": "Q", "K": "K", "A": "A",
 }
 
-Use standard 2-char card notation: rank (23456789TJQKA) + suit (h/d/s/c).
-If something is not visible or unclear, use null. Only return the JSON object, nothing else."""
+POSITIONS_9 = ["BTN", "SB", "BB", "UTG", "UTG1", "UTG2", "LJ", "HJ", "CO"]
+POSITIONS_6 = ["BTN", "SB", "BB", "UTG", "HJ", "CO"]
 
 
-def get_api_key():
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        print("Error: ANTHROPIC_API_KEY environment variable not set.")
-        print("Export it:  export ANTHROPIC_API_KEY=sk-ant-...")
-        sys.exit(1)
-    return key
-
-
-def take_screenshot(region=None):
-    """Capture screen using grim. Returns path to PNG."""
-    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(SCREENSHOT_DIR, f"capture_{timestamp}.png")
-
-    cmd = ["grim"]
-    if region:
-        cmd += ["-g", region]
-    cmd.append(path)
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"grim failed: {result.stderr.strip()}")
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
         return None
-    return path
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
 
 
-def select_region():
-    """Use slurp to let user select a screen region. Returns geometry string."""
-    print("Select the poker game region with your mouse...")
-    result = subprocess.run(["slurp"], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"slurp cancelled or failed: {result.stderr.strip()}")
-        return None
-    return result.stdout.strip()
+def save_config(config):
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
 
 
-def parse_screenshot(image_path, api_key):
-    """Send screenshot to Claude Vision API and parse the poker board state."""
-    with open(image_path, "rb") as f:
-        image_data = base64.b64encode(f.read()).decode("utf-8")
+def crop_region(img, region):
+    """Crop image to [x, y, w, h] region."""
+    x, y, w, h = region
+    return img.crop((x, y, x + w, y + h))
 
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
 
-    payload = {
-        "model": MODEL,
-        "max_tokens": 1024,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": image_data,
-                        },
-                    },
-                    {"type": "text", "text": PARSE_PROMPT},
-                ],
-            }
-        ],
-    }
-
-    print("Sending to Claude Vision API...")
-    resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
-
-    if resp.status_code != 200:
-        print(f"API error ({resp.status_code}): {resp.text[:300]}")
-        return None
-
-    data = resp.json()
-    text = data["content"][0]["text"]
-
-    # Extract JSON from response (strip markdown fences if present)
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        text = text.rsplit("```", 1)[0]
-        text = text.strip()
-
+def ocr_text(img, psm=7):
+    """Run OCR on a cropped image region."""
+    if pytesseract is None:
+        return ""
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        print(f"Failed to parse JSON from API response:\n{text}")
-        return None
+        return pytesseract.image_to_string(img, config=f"--psm {psm}").strip()
+    except Exception:
+        return ""
 
 
-def print_board_state(state):
-    """Pretty-print the parsed board state."""
-    if not state:
-        print("  (no state parsed)")
-        return
-
-    stage = state.get("stage", "unknown")
-    community = state.get("community_cards", [])
-    hero = state.get("hero_hand", [])
-    pot = state.get("pot")
-    current_bet = state.get("current_bet")
-
-    print(f"  Stage:     {stage}")
-    print(f"  Board:     {' '.join(community) if community else '(none)'}")
-    print(f"  Hero:      {' '.join(hero) if hero else '(not visible)'}")
-    if pot is not None:
-        print(f"  Pot:       {pot}")
-    if current_bet is not None:
-        print(f"  To call:   {current_bet}")
-
-    players = state.get("players", [])
-    if players:
-        print(f"  Players:")
-        for p in players:
-            pos = p.get("position", "?")
-            stack = p.get("stack", "?")
-            bet = p.get("bet", 0)
-            folded = p.get("folded", False)
-            status = "folded" if folded else f"bet {bet}"
-            print(f"    {pos}: stack={stack}, {status}")
-
-    notes = state.get("notes")
-    if notes:
-        print(f"  Notes:     {notes}")
-
-
-def run_terminal_mode(api_key, use_region):
-    """Capture on Enter keypress in terminal."""
-    region = None
-    if use_region:
-        region = select_region()
-        if not region:
-            print("No region selected, capturing full screen.")
-
-    print("\nPoker Screen Parser ready.")
-    print("Press Enter to capture, 'q' + Enter to quit.\n")
-
-    while True:
+def parse_number(text):
+    """Extract a float from OCR text like '2.4 BB', '$150', '16.8'."""
+    text = text.replace(",", ".")
+    cleaned = re.sub(r"[^\d.]", "", text)
+    match = re.search(r"\d+\.?\d*", cleaned)
+    if match:
         try:
-            line = input("> ")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if line.strip().lower() == "q":
-            break
-
-        path = take_screenshot(region)
-        if not path:
-            continue
-        print(f"Screenshot: {path}")
-
-        state = parse_screenshot(path, api_key)
-        print_board_state(state)
-
-        # Run advisor
-        if state and state.get("hero_hand"):
-            analysis = analyze(state)
-            if analysis:
-                print_analysis(analysis)
-
-        # Also dump raw JSON
-        if state:
-            json_path = path.replace(".png", ".json")
-            with open(json_path, "w") as f:
-                json.dump(state, f, indent=2)
-            print(f"  Saved:     {json_path}")
-        print()
+            return float(match.group())
+        except ValueError:
+            return None
+    return None
 
 
-def run_evdev_mode(api_key, key_name, use_region):
-    """Capture on global hotkey via evdev."""
-    try:
-        import evdev
-        from evdev import ecodes
-    except ImportError:
-        print("evdev not available. Install with: pip install evdev")
-        sys.exit(1)
+def detect_suit(card_img):
+    """Detect card suit by color analysis.
 
-    key_code = getattr(ecodes, f"KEY_{key_name.upper()}", None)
-    if key_code is None:
-        print(f"Unknown key: {key_name}")
-        print("Examples: F12, PAUSE, SCROLLLOCK, F9")
-        sys.exit(1)
+    PokerStars suit colors: spades=black, hearts=red, diamonds=blue, clubs=green.
+    """
+    img_rgb = card_img.convert("RGB")
+    pixels = list(img_rgb.getdata())
+    if not pixels:
+        return None
 
-    # Find keyboard devices
-    devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
-    keyboards = [d for d in devices if ecodes.EV_KEY in d.capabilities()]
+    colored = []
+    dark_count = 0
+    for r, g, b in pixels:
+        brightness = (r + g + b) / 3
+        if brightness < 60:
+            dark_count += 1
+        elif 40 < brightness < 210:
+            colored.append((r, g, b))
 
-    if not keyboards:
-        print("No keyboard devices found. You may need to be in the 'input' group:")
-        print("  sudo usermod -aG input $USER")
-        sys.exit(1)
+    if not colored:
+        if dark_count > len(pixels) * 0.15:
+            return "s"
+        return None
 
-    region = None
-    if use_region:
-        region = select_region()
-        if not region:
-            print("No region selected, capturing full screen.")
+    avg_r = sum(p[0] for p in colored) / len(colored)
+    avg_g = sum(p[1] for p in colored) / len(colored)
+    avg_b = sum(p[2] for p in colored) / len(colored)
 
-    print(f"\nPoker Screen Parser ready. Press {key_name.upper()} to capture.")
-    print("Press Ctrl+C to quit.\n")
-
-    try:
-        import select as sel
-
-        while True:
-            r, _, _ = sel.select(keyboards, [], [], 1.0)
-            for dev in r:
-                for event in dev.read():
-                    if event.type == ecodes.EV_KEY and event.value == 1:  # key down
-                        if event.code == key_code:
-                            print(f"[{time.strftime('%H:%M:%S')}] Capturing...")
-                            path = take_screenshot(region)
-                            if not path:
-                                continue
-                            print(f"Screenshot: {path}")
-
-                            state = parse_screenshot(path, api_key)
-                            print_board_state(state)
-
-                            if state and state.get("hero_hand"):
-                                analysis = analyze(state)
-                                if analysis:
-                                    print_analysis(analysis)
-
-                            if state:
-                                json_path = path.replace(".png", ".json")
-                                with open(json_path, "w") as f:
-                                    json.dump(state, f, indent=2)
-                                print(f"  Saved:     {json_path}")
-                            print()
-    except KeyboardInterrupt:
-        print("\nStopped.")
-    finally:
-        for d in keyboards:
-            d.close()
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Poker screen parser using Claude Vision")
-    parser.add_argument("--region", action="store_true",
-                        help="Use slurp to select a screen region")
-    parser.add_argument("--key", type=str, default=None,
-                        help="Global hotkey via evdev (e.g. F12, PAUSE)")
-    args = parser.parse_args()
-
-    api_key = get_api_key()
-
-    if args.key:
-        run_evdev_mode(api_key, args.key, args.region)
+    if avg_r > avg_g * 1.3 and avg_r > avg_b * 1.3 and avg_r > 100:
+        return "h"  # hearts (red)
+    elif avg_g > avg_r * 1.2 and avg_g > avg_b and avg_g > 70:
+        return "c"  # clubs (green)
+    elif avg_b > avg_r * 1.2 and avg_b > avg_g and avg_b > 90:
+        return "d"  # diamonds (blue)
     else:
-        run_terminal_mode(api_key, args.region)
+        return "s"  # spades (dark/neutral)
 
 
-if __name__ == "__main__":
-    main()
+def card_present(card_img):
+    """Check if a card is actually visible (not empty table felt)."""
+    gray = card_img.convert("L")
+    pixels = list(gray.getdata())
+    if not pixels:
+        return False
+    avg = sum(pixels) / len(pixels)
+    variance = sum((p - avg) ** 2 for p in pixels) / len(pixels)
+    return avg > 80 and variance > 500
+
+
+def detect_card(card_img):
+    """Detect rank and suit of a single card image. Returns e.g. 'Ah' or None."""
+    if not card_present(card_img):
+        return None
+
+    w, h = card_img.size
+
+    # Rank: OCR the top-left corner
+    rank_crop = card_img.crop((0, 0, max(1, int(w * 0.55)), max(1, int(h * 0.40))))
+    rank_bw = rank_crop.convert("L").point(lambda x: 0 if x < 140 else 255, "1")
+    rank_text = ocr_text(rank_bw, psm=10).upper().strip()
+
+    # Clean common OCR errors
+    rank_text = rank_text.replace("O", "0").replace("I", "1").replace("L", "1")
+    rank = None
+    for key, val in RANK_MAP.items():
+        if key in rank_text:
+            rank = val
+            break
+    if not rank and len(rank_text) == 1 and rank_text in "23456789TJQKA":
+        rank = rank_text
+
+    if not rank:
+        return None
+
+    # Suit: color analysis on the suit symbol area
+    suit_crop = card_img.crop((0, max(1, int(h * 0.30)), max(1, int(w * 0.65)), max(2, int(h * 0.75))))
+    suit = detect_suit(suit_crop)
+
+    if not suit:
+        return None
+
+    return rank + suit
+
+
+def detect_cards_in_region(img, region, num_slots):
+    """Detect cards by splitting a region into equal-width slots."""
+    region_img = crop_region(img, region)
+    cards = []
+    slot_w = region_img.size[0] // num_slots
+    for i in range(num_slots):
+        card_img = region_img.crop((i * slot_w, 0, (i + 1) * slot_w, region_img.size[1]))
+        card = detect_card(card_img)
+        if card:
+            cards.append(card)
+    return cards
+
+
+def _button_score(btn_img):
+    """Score how likely a region contains the dealer button (bright white/yellow circle)."""
+    pixels = list(btn_img.convert("RGB").getdata())
+    if not pixels:
+        return 0.0
+    bright = sum(
+        1 for r, g, b in pixels
+        if r > 180 and g > 160 and b > 80 and (r + g + b) / 3 > 170
+    )
+    return bright / len(pixels)
+
+
+def find_button_seat(table_img, config):
+    """Find which seat has the dealer button. Returns seat index, 'hero', or None."""
+    best_idx = None
+    best_score = 0.0
+
+    for i, seat in enumerate(config.get("seats", [])):
+        if not seat.get("button"):
+            continue
+        score = _button_score(crop_region(table_img, seat["button"]))
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if config.get("hero_button"):
+        score = _button_score(crop_region(table_img, config["hero_button"]))
+        if score > best_score:
+            best_score = score
+            best_idx = "hero"
+
+    return best_idx if best_score > 0.08 else None
+
+
+def assign_positions(n_seats, button_idx):
+    """Assign poker position names clockwise from the button.
+
+    Returns list of position names indexed by seat.
+    """
+    pos_list = POSITIONS_9[:n_seats] if n_seats > 6 else POSITIONS_6[:n_seats]
+    positions = [None] * n_seats
+    for i, pos in enumerate(pos_list):
+        seat = (button_idx + i) % n_seats
+        positions[seat] = pos
+    return positions
+
+
+def parse_game_state(table_img, config):
+    """Parse a cropped table screenshot into a game state dict.
+
+    table_img: PIL Image already cropped to the table region.
+    config: parsed pud_config.json (regions are relative to table).
+
+    Returns: game state dict compatible with advisor.analyze().
+    """
+    state = {
+        "community_cards": [],
+        "hero_hand": [],
+        "hero_position": config.get("hero_position", "BTN"),
+        "pot": 0,
+        "stage": "preflop",
+        "players": [],
+        "current_bet": 0,
+        "big_blind": config.get("big_blind", 1),
+    }
+
+    # Hero cards
+    if config.get("hero_cards"):
+        state["hero_hand"] = detect_cards_in_region(table_img, config["hero_cards"], 2)
+
+    # Board cards
+    if config.get("board"):
+        state["community_cards"] = detect_cards_in_region(table_img, config["board"], 5)
+
+    n_community = len(state["community_cards"])
+    state["stage"] = {0: "preflop", 3: "flop", 4: "turn", 5: "river"}.get(n_community, "postflop")
+
+    # Pot
+    if config.get("pot"):
+        pot_text = ocr_text(crop_region(table_img, config["pot"]))
+        pot_val = parse_number(pot_text)
+        if pot_val is not None:
+            state["pot"] = pot_val
+
+    # Hero stack
+    hero_stack = 0
+    if config.get("hero_stack"):
+        stack_text = ocr_text(crop_region(table_img, config["hero_stack"]))
+        stack_val = parse_number(stack_text)
+        if stack_val is not None:
+            hero_stack = stack_val
+
+    # Hero bet
+    hero_bet = 0
+    if config.get("hero_bet"):
+        bet_text = ocr_text(crop_region(table_img, config["hero_bet"]))
+        bet_val = parse_number(bet_text)
+        if bet_val is not None:
+            hero_bet = bet_val
+
+    # Seat ordering: opponents are seats 0..n-1, hero is seat n
+    seats = config.get("seats", [])
+    n_total = 1 + len(seats)
+    hero_seat_idx = len(seats)
+
+    # Button detection -> position assignment
+    button_raw = find_button_seat(table_img, config)
+    if button_raw == "hero":
+        button_seat_idx = hero_seat_idx
+    elif button_raw is not None:
+        button_seat_idx = button_raw
+    else:
+        button_seat_idx = None
+
+    if button_seat_idx is not None:
+        pos_names = assign_positions(n_total, button_seat_idx)
+        hero_position = pos_names[hero_seat_idx]
+    else:
+        hero_position = config.get("hero_position", "BTN")
+        pos_names = None
+
+    state["hero_position"] = hero_position
+
+    # Opponent seats
+    max_bet = hero_bet
+    for i, seat in enumerate(seats):
+        if pos_names:
+            pos = pos_names[i]
+        else:
+            pos = seat.get("position", f"S{i+1}")
+
+        player = {"position": pos, "folded": False, "bet": 0, "stack": 0}
+
+        if seat.get("stack"):
+            stack_text = ocr_text(crop_region(table_img, seat["stack"]))
+            stack_val = parse_number(stack_text)
+            if stack_val is not None:
+                player["stack"] = stack_val
+            else:
+                player["folded"] = True
+
+        if seat.get("bet"):
+            bet_text = ocr_text(crop_region(table_img, seat["bet"]))
+            bet_val = parse_number(bet_text)
+            if bet_val is not None:
+                player["bet"] = bet_val
+                max_bet = max(max_bet, bet_val)
+
+        state["players"].append(player)
+
+    # Hero player entry
+    state["players"].append({
+        "position": hero_position,
+        "stack": hero_stack,
+        "bet": hero_bet,
+        "folded": False,
+    })
+
+    state["current_bet"] = max_bet
+    return state

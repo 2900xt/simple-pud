@@ -2,178 +2,263 @@
 """
 PUD - Poker Utility & Decision engine.
 
-Loops on a hotkey: captures screen, parses board state via Claude Vision,
-estimates opponent range, calculates equity, and recommends best action + sizing.
+Capture -> OCR Parse -> Range Estimate -> Equity -> Best Play
 
-Config via .env file in project root:
-    ANTHROPIC_API_KEY=sk-ant-...
-    HOTKEY=F12
-    CAPTURE_REGION=
+No LLM needed. Uses screen region config + pytesseract OCR + color analysis.
+
+First run:  ./pud --setup    (configure screen regions via slurp)
+Then:       ./pud            (start analyzing)
 """
 
+import json
 import os
+import subprocess
+import shutil
 import sys
+import time
+import select as sel
 
-# Resolve project root (where this script lives)
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.path.join(PROJECT_ROOT, "tools")
 sys.path.insert(0, TOOLS_DIR)
 
-# ─── Load .env ───────────────────────────────────────────────────────────────
-
-def load_env():
-    env_path = os.path.join(PROJECT_ROOT, ".env")
-    if not os.path.exists(env_path):
-        print(f"No .env file found at {env_path}")
-        print("Create one with at least: ANTHROPIC_API_KEY=sk-ant-...")
-        sys.exit(1)
-    with open(env_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip()
-            if value and value not in ("your-api-key-here",):
-                os.environ.setdefault(key, value)
-
-load_env()
-
-# ─── Imports (after .env loaded) ─────────────────────────────────────────────
-
-import json
-import time
-import base64
-import select as sel
-
-import requests
-
-from advisor import analyze, print_analysis
-
-API_URL = "https://api.anthropic.com/v1/messages"
-MODEL = "claude-sonnet-4-20250514"
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "pud_config.json")
 SCREENSHOT_DIR = os.path.join(PROJECT_ROOT, "screenshots")
 
-PARSE_PROMPT = """Analyze this poker game screenshot. Extract the board state as JSON with these fields:
-
-{
-  "community_cards": ["Ah", "Kd", "5c"],
-  "hero_hand": ["As", "Ks"],
-  "hero_position": "BTN",
-  "pot": 150,
-  "stage": "flop",
-  "players": [
-    {"position": "BTN", "stack": 200, "bet": 0, "folded": false},
-    {"position": "CO", "stack": 180, "bet": 25, "folded": false}
-  ],
-  "current_bet": 25,
-  "big_blind": 2,
-  "notes": ""
-}
-
-Use standard 2-char card notation: rank (23456789TJQKA) + suit (h/d/s/c).
-If something is not visible or unclear, use null. Only return the JSON object."""
+BOLD = "\033[1m"
+DIM = "\033[2m"
+R = "\033[0m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
 
 
-def get_api_key():
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        print("Error: ANTHROPIC_API_KEY not set.")
-        print("Add it to .env:  ANTHROPIC_API_KEY=sk-ant-...")
+def check_deps():
+    missing = []
+    if not shutil.which("tesseract"):
+        missing.append("tesseract (sudo dnf install tesseract)")
+    if not shutil.which("grim"):
+        missing.append("grim (sudo dnf install grim)")
+    if not shutil.which("slurp"):
+        missing.append("slurp (sudo dnf install slurp)")
+    try:
+        import pytesseract  # noqa: F401
+    except ImportError:
+        missing.append("pytesseract (pip install pytesseract)")
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        missing.append("Pillow (pip install Pillow)")
+    if missing:
+        print(f"{RED}Missing dependencies:{R}")
+        for m in missing:
+            print(f"  - {m}")
         sys.exit(1)
-    return key
 
 
 def take_screenshot(region=None):
-    import subprocess
+    """Capture screen via grim. If region given, capture just that region."""
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     path = os.path.join(SCREENSHOT_DIR, f"cap_{ts}.png")
+
     cmd = ["grim"]
     if region:
+        # region is "X,Y WxH" slurp format
         cmd += ["-g", region]
     cmd.append(path)
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"  grim failed: {r.stderr.strip()}")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        print("  Screenshot timed out.")
         return None
+
+    if result.returncode != 0:
+        print(f"  grim failed: {result.stderr.strip()}")
+        return None
+
     return path
 
 
-def select_region():
-    import subprocess
-    print("  Select the poker game region with your mouse...")
-    r = subprocess.run(["slurp"], capture_output=True, text=True)
-    if r.returncode != 0:
-        return None
-    return r.stdout.strip()
-
-
-def parse_screenshot(image_path, api_key):
-    with open(image_path, "rb") as f:
-        image_data = base64.b64encode(f.read()).decode("utf-8")
-
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": MODEL,
-        "max_tokens": 1024,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_data}},
-                {"type": "text", "text": PARSE_PROMPT},
-            ],
-        }],
-    }
-
-    print("  Parsing screenshot...")
-    resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
-    if resp.status_code != 200:
-        print(f"  API error ({resp.status_code}): {resp.text[:200]}")
-        return None
-
-    text = resp.json()["content"][0]["text"].strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+def slurp_region(prompt):
+    """Use slurp to let user visually select a screen region.
+    Returns [x, y, w, h] or None.
+    """
+    print(f"  {BOLD}{prompt}{R}")
+    print(f"  {DIM}Draw a rectangle on screen with your mouse...{R}")
 
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        print(f"  Parse error: {text[:200]}")
+        result = subprocess.run(
+            ["slurp"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        print("  Selection timed out.")
+        return None
+
+    if result.returncode != 0:
+        print("  Selection cancelled.")
+        return None
+
+    # slurp outputs "X,Y WxH\n"
+    raw = result.stdout.strip()
+    try:
+        pos, size = raw.split()
+        x, y = pos.split(",")
+        w, h = size.split("x")
+        region = [int(x), int(y), int(w), int(h)]
+        print(f"  {GREEN}Got: {raw}{R}")
+        return region
+    except (ValueError, IndexError):
+        print(f"  Could not parse slurp output: {raw}")
         return None
 
 
-def process_capture(api_key, region):
+def region_to_slurp(region):
+    """Convert [x, y, w, h] to slurp/grim format 'X,Y WxH'."""
+    return f"{region[0]},{region[1]} {region[2]}x{region[3]}"
+
+
+def make_relative(region, table):
+    """Convert absolute screen region to table-relative coordinates."""
+    return [region[0] - table[0], region[1] - table[1], region[2], region[3]]
+
+
+# ─── Setup Wizard ────────────────────────────────────────────────────────────
+
+def setup_wizard():
+    from screen_parser import save_config
+
+    print(f"\n{BOLD}PUD Setup - Configure Screen Regions{R}")
+    print("=" * 50)
+    print(f"\nMake sure your poker table is visible on screen.")
+    print(f"For each step, you'll draw a rectangle with your mouse.\n")
+
+    config = {}
+
+    # Table region (absolute)
+    table = slurp_region("Step 1: Select the TABLE (entire poker table window)")
+    if not table:
+        print("Table region is required.")
+        sys.exit(1)
+    config["table"] = table
+
+    # All subsequent regions are selected on-screen (absolute) then stored relative to table
+    steps = [
+        ("hero_cards", "Step 2: Select your HERO CARDS (your 2 hole cards)", True),
+        ("board",      "Step 3: Select the BOARD (where flop/turn/river appear, all 5 slots)", True),
+        ("pot",        "Step 4: Select the POT display (text showing pot size)", True),
+        ("hero_stack", "Step 5: Select your STACK display (your chip/BB count)", True),
+        ("hero_bet",   "Step 6: Select your BET area (where your current bet shows)", False),
+        ("hero_button","Step 7: Select your DEALER BUTTON area (where D appears when you're BTN)", False),
+    ]
+
+    for key, prompt, required in steps:
+        region = slurp_region(prompt)
+        if region:
+            config[key] = make_relative(region, table)
+        elif required:
+            print(f"  {RED}This region is required.{R}")
+            region = slurp_region(f"  Try again: {prompt}")
+            if region:
+                config[key] = make_relative(region, table)
+            else:
+                print("  Skipping (you can edit pud_config.json later).")
+                config[key] = None
+        else:
+            config[key] = None
+            print(f"  {DIM}Skipped (optional).{R}")
+
+    # Big blind
+    print()
+    while True:
+        try:
+            bb = input(f"  Big blind size (1 for BB format, or chip value like 100) [{BOLD}1{R}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            bb = ""
+        config["big_blind"] = float(bb) if bb else 1.0
+        break
+
+    # Opponent seats
+    print()
+    while True:
+        try:
+            n = input(f"  How many opponent seats to configure? [{BOLD}8{R}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            n = ""
+        try:
+            n_seats = int(n) if n else 8
+            break
+        except ValueError:
+            print("  Enter a number.")
+
+    config["seats"] = []
+    for i in range(n_seats):
+        print(f"\n  {BOLD}--- Opponent {i+1}/{n_seats} ---{R}")
+
+        seat = {}
+        stack = slurp_region(f"Opponent {i+1} STACK (their chip/BB count)")
+        seat["stack"] = make_relative(stack, table) if stack else None
+
+        bet = slurp_region(f"Opponent {i+1} BET area (optional, press Esc to skip)")
+        seat["bet"] = make_relative(bet, table) if bet else None
+
+        btn = slurp_region(f"Opponent {i+1} BUTTON area (optional, press Esc to skip)")
+        seat["button"] = make_relative(btn, table) if btn else None
+
+        config["seats"].append(seat)
+
+    config["hero_position"] = "BTN"  # fallback if button detection fails
+
+    save_config(config)
+    print(f"\n{GREEN}Config saved to: {CONFIG_PATH}{R}")
+    print(f"Run {BOLD}./pud{R} to start analyzing!")
+    print(f"{DIM}Edit {CONFIG_PATH} directly to fine-tune regions.{R}\n")
+
+
+# ─── Capture & Analyze ───────────────────────────────────────────────────────
+
+def process_capture(config):
     """Single capture -> parse -> analyze -> print."""
-    path = take_screenshot(region)
+    from PIL import Image
+    from screen_parser import parse_game_state, crop_region
+
+    # Capture the table region directly
+    table_region = config["table"]
+    path = take_screenshot(region_to_slurp(table_region))
     if not path:
         return
 
-    print(f"  Screenshot: {path}")
-    state = parse_screenshot(path, api_key)
-    if not state:
-        print("  Could not parse game state.")
-        return
+    table_img = Image.open(path)
 
-    # Quick state summary
-    stage = state.get("stage", "?")
+    print(f"  Screenshot: {path}")
+    print("  Parsing...")
+
+    state = parse_game_state(table_img, config)
+
     hero = state.get("hero_hand", [])
     board = state.get("community_cards", [])
-    pot = state.get("pot")
-    print(f"  {stage.upper()}: hero={' '.join(hero) if hero else '?'} "
+    stage = state.get("stage", "?")
+    pot = state.get("pot", 0)
+
+    print(f"  {BOLD}{stage.upper()}{R}: hero={' '.join(hero) if hero else '?'} "
           f"board={' '.join(board) if board else '-'} pot={pot}")
 
+    active = [p for p in state.get("players", []) if not p.get("folded")]
+    if active:
+        parts = [f"{p['position']}({p['stack']})" for p in active]
+        print(f"  Players: {', '.join(parts)}")
+
+    if state.get("hero_position"):
+        print(f"  Hero pos: {state['hero_position']}")
+
     if hero and len(hero) >= 2:
+        from advisor import analyze, print_analysis
         analysis = analyze(state)
         if analysis:
             print_analysis(analysis)
 
-            # Save analysis
             json_path = path.replace(".png", ".json")
             with open(json_path, "w") as f:
                 json.dump({"state": state, "analysis": {
@@ -182,25 +267,28 @@ def process_capture(api_key, region):
                     "decision": analysis["decision"],
                 }}, f, indent=2)
     else:
-        print("  Hero hand not visible - skipping analysis.")
+        print(f"  {YELLOW}Hero hand not detected - skipping analysis.{R}")
+        json_path = path.replace(".png", ".json")
+        with open(json_path, "w") as f:
+            json.dump({"state": state}, f, indent=2)
 
 
-def run_hotkey_loop(api_key, hotkey, region):
-    """Global hotkey loop using evdev."""
+# ─── Main Loops ──────────────────────────────────────────────────────────────
+
+def run_hotkey_loop(config, hotkey):
     try:
         import evdev
         from evdev import ecodes
     except ImportError:
-        print("evdev not available. Install: pip install evdev")
-        print("Falling back to terminal mode (press Enter).\n")
-        run_terminal_loop(api_key, region)
+        print("evdev not available. Falling back to terminal mode.\n")
+        run_terminal_loop(config)
         return
 
     key_code = getattr(ecodes, f"KEY_{hotkey.upper()}", None)
     if key_code is None:
         print(f"Unknown hotkey: {hotkey}")
-        print("Valid keys: F1-F12, PAUSE, SCROLLLOCK, INSERT, etc.")
-        sys.exit(1)
+        run_terminal_loop(config)
+        return
 
     devices = [evdev.InputDevice(p) for p in evdev.list_devices()]
     keyboards = [d for d in devices if ecodes.EV_KEY in d.capabilities()]
@@ -208,14 +296,12 @@ def run_hotkey_loop(api_key, hotkey, region):
     if not keyboards:
         print("No input devices found. Add yourself to the input group:")
         print("  sudo usermod -aG input $USER")
-        print("Falling back to terminal mode (press Enter).\n")
-        run_terminal_loop(api_key, region)
+        print("Falling back to terminal mode.\n")
+        run_terminal_loop(config)
         return
 
-    BOLD = "\033[1m"
-    R = "\033[0m"
     print(f"\n{BOLD}PUD ready. Press {hotkey.upper()} to analyze.{R}")
-    print(f"Press Ctrl+C to quit.\n")
+    print("Press Ctrl+C to quit.\n")
 
     try:
         while True:
@@ -223,10 +309,10 @@ def run_hotkey_loop(api_key, hotkey, region):
             for dev in r:
                 for event in dev.read():
                     if (event.type == ecodes.EV_KEY and
-                        event.value == 1 and
-                        event.code == key_code):
+                            event.value == 1 and
+                            event.code == key_code):
                         print(f"\n[{time.strftime('%H:%M:%S')}] Capture triggered")
-                        process_capture(api_key, region)
+                        process_capture(config)
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
@@ -234,10 +320,7 @@ def run_hotkey_loop(api_key, hotkey, region):
             d.close()
 
 
-def run_terminal_loop(api_key, region):
-    """Fallback: press Enter in terminal to capture."""
-    BOLD = "\033[1m"
-    R = "\033[0m"
+def run_terminal_loop(config):
     print(f"\n{BOLD}PUD ready. Press Enter to analyze, 'q' to quit.{R}\n")
 
     while True:
@@ -248,44 +331,44 @@ def run_terminal_loop(api_key, region):
         if line.strip().lower() == "q":
             break
         print(f"\n[{time.strftime('%H:%M:%S')}] Capture triggered")
-        process_capture(api_key, region)
+        process_capture(config)
 
+
+# ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    R = "\033[0m"
-
     print(f"{BOLD}PUD - Poker Utility & Decision Engine{R}")
-    print(f"{DIM}Screenshot -> Parse -> Range Estimate -> Equity -> Best Play{R}\n")
+    print(f"{DIM}Capture -> OCR Parse -> Range Estimate -> Equity -> Best Play{R}\n")
 
-    api_key = get_api_key()
+    if "--setup" in sys.argv:
+        check_deps()
+        setup_wizard()
+        return
 
-    # Build equity_calc if needed
+    from screen_parser import load_config
+    config = load_config()
+    if not config:
+        print(f"No config found. Run: {BOLD}./pud --setup{R}")
+        sys.exit(1)
+
+    check_deps()
+
     equity_path = os.path.join(PROJECT_ROOT, "equity_calc")
     if not os.path.exists(equity_path):
-        import subprocess
         print("Building equity calculator...")
         subprocess.run(["make", "equity"], cwd=PROJECT_ROOT, check=True)
 
-    # Region selection
-    region = os.environ.get("CAPTURE_REGION", "").strip() or None
-    if not region:
-        print("No CAPTURE_REGION set. Would you like to select one? [y/N] ", end="", flush=True)
-        try:
-            choice = input().strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            choice = "n"
-        if choice in ("y", "yes"):
-            region = select_region()
-            if region:
-                print(f"  Region: {region}")
-                print(f"  {DIM}(Add to .env: CAPTURE_REGION={region}){R}")
+    # Load hotkey from .env (optional)
+    hotkey = "F12"
+    env_path = os.path.join(PROJECT_ROOT, ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("HOTKEY="):
+                    hotkey = line.split("=", 1)[1].strip()
 
-    # Hotkey
-    hotkey = os.environ.get("HOTKEY", "F12").strip()
-
-    run_hotkey_loop(api_key, hotkey, region)
+    run_hotkey_loop(config, hotkey)
 
 
 if __name__ == "__main__":
