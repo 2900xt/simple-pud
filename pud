@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+PUD - Poker Utility & Decision engine.
+
+Loops on a hotkey: captures screen, parses board state via Claude Vision,
+estimates opponent range, calculates equity, and recommends best action + sizing.
+
+Config via .env file in project root:
+    ANTHROPIC_API_KEY=sk-ant-...
+    HOTKEY=F12
+    CAPTURE_REGION=
+"""
+
+import os
+import sys
+
+# Resolve project root (where this script lives)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+TOOLS_DIR = os.path.join(PROJECT_ROOT, "tools")
+sys.path.insert(0, TOOLS_DIR)
+
+# ─── Load .env ───────────────────────────────────────────────────────────────
+
+def load_env():
+    env_path = os.path.join(PROJECT_ROOT, ".env")
+    if not os.path.exists(env_path):
+        print(f"No .env file found at {env_path}")
+        print("Create one with at least: ANTHROPIC_API_KEY=sk-ant-...")
+        sys.exit(1)
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if value and value not in ("your-api-key-here",):
+                os.environ.setdefault(key, value)
+
+load_env()
+
+# ─── Imports (after .env loaded) ─────────────────────────────────────────────
+
+import json
+import time
+import base64
+import select as sel
+
+import requests
+
+from advisor import analyze, print_analysis
+
+API_URL = "https://api.anthropic.com/v1/messages"
+MODEL = "claude-sonnet-4-20250514"
+SCREENSHOT_DIR = os.path.join(PROJECT_ROOT, "screenshots")
+
+PARSE_PROMPT = """Analyze this poker game screenshot. Extract the board state as JSON with these fields:
+
+{
+  "community_cards": ["Ah", "Kd", "5c"],
+  "hero_hand": ["As", "Ks"],
+  "hero_position": "BTN",
+  "pot": 150,
+  "stage": "flop",
+  "players": [
+    {"position": "BTN", "stack": 200, "bet": 0, "folded": false},
+    {"position": "CO", "stack": 180, "bet": 25, "folded": false}
+  ],
+  "current_bet": 25,
+  "big_blind": 2,
+  "notes": ""
+}
+
+Use standard 2-char card notation: rank (23456789TJQKA) + suit (h/d/s/c).
+If something is not visible or unclear, use null. Only return the JSON object."""
+
+
+def get_api_key():
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        print("Error: ANTHROPIC_API_KEY not set.")
+        print("Add it to .env:  ANTHROPIC_API_KEY=sk-ant-...")
+        sys.exit(1)
+    return key
+
+
+def take_screenshot(region=None):
+    import subprocess
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(SCREENSHOT_DIR, f"cap_{ts}.png")
+    cmd = ["grim"]
+    if region:
+        cmd += ["-g", region]
+    cmd.append(path)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  grim failed: {r.stderr.strip()}")
+        return None
+    return path
+
+
+def select_region():
+    import subprocess
+    print("  Select the poker game region with your mouse...")
+    r = subprocess.run(["slurp"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
+def parse_screenshot(image_path, api_key):
+    with open(image_path, "rb") as f:
+        image_data = base64.b64encode(f.read()).decode("utf-8")
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": MODEL,
+        "max_tokens": 1024,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_data}},
+                {"type": "text", "text": PARSE_PROMPT},
+            ],
+        }],
+    }
+
+    print("  Parsing screenshot...")
+    resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+    if resp.status_code != 200:
+        print(f"  API error ({resp.status_code}): {resp.text[:200]}")
+        return None
+
+    text = resp.json()["content"][0]["text"].strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        print(f"  Parse error: {text[:200]}")
+        return None
+
+
+def process_capture(api_key, region):
+    """Single capture -> parse -> analyze -> print."""
+    path = take_screenshot(region)
+    if not path:
+        return
+
+    print(f"  Screenshot: {path}")
+    state = parse_screenshot(path, api_key)
+    if not state:
+        print("  Could not parse game state.")
+        return
+
+    # Quick state summary
+    stage = state.get("stage", "?")
+    hero = state.get("hero_hand", [])
+    board = state.get("community_cards", [])
+    pot = state.get("pot")
+    print(f"  {stage.upper()}: hero={' '.join(hero) if hero else '?'} "
+          f"board={' '.join(board) if board else '-'} pot={pot}")
+
+    if hero and len(hero) >= 2:
+        analysis = analyze(state)
+        if analysis:
+            print_analysis(analysis)
+
+            # Save analysis
+            json_path = path.replace(".png", ".json")
+            with open(json_path, "w") as f:
+                json.dump({"state": state, "analysis": {
+                    "villain_range": analysis["villain_range"],
+                    "equity": analysis["equity"],
+                    "decision": analysis["decision"],
+                }}, f, indent=2)
+    else:
+        print("  Hero hand not visible - skipping analysis.")
+
+
+def run_hotkey_loop(api_key, hotkey, region):
+    """Global hotkey loop using evdev."""
+    try:
+        import evdev
+        from evdev import ecodes
+    except ImportError:
+        print("evdev not available. Install: pip install evdev")
+        print("Falling back to terminal mode (press Enter).\n")
+        run_terminal_loop(api_key, region)
+        return
+
+    key_code = getattr(ecodes, f"KEY_{hotkey.upper()}", None)
+    if key_code is None:
+        print(f"Unknown hotkey: {hotkey}")
+        print("Valid keys: F1-F12, PAUSE, SCROLLLOCK, INSERT, etc.")
+        sys.exit(1)
+
+    devices = [evdev.InputDevice(p) for p in evdev.list_devices()]
+    keyboards = [d for d in devices if ecodes.EV_KEY in d.capabilities()]
+
+    if not keyboards:
+        print("No input devices found. Add yourself to the input group:")
+        print("  sudo usermod -aG input $USER")
+        print("Falling back to terminal mode (press Enter).\n")
+        run_terminal_loop(api_key, region)
+        return
+
+    BOLD = "\033[1m"
+    R = "\033[0m"
+    print(f"\n{BOLD}PUD ready. Press {hotkey.upper()} to analyze.{R}")
+    print(f"Press Ctrl+C to quit.\n")
+
+    try:
+        while True:
+            r, _, _ = sel.select(keyboards, [], [], 1.0)
+            for dev in r:
+                for event in dev.read():
+                    if (event.type == ecodes.EV_KEY and
+                        event.value == 1 and
+                        event.code == key_code):
+                        print(f"\n[{time.strftime('%H:%M:%S')}] Capture triggered")
+                        process_capture(api_key, region)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        for d in keyboards:
+            d.close()
+
+
+def run_terminal_loop(api_key, region):
+    """Fallback: press Enter in terminal to capture."""
+    BOLD = "\033[1m"
+    R = "\033[0m"
+    print(f"\n{BOLD}PUD ready. Press Enter to analyze, 'q' to quit.{R}\n")
+
+    while True:
+        try:
+            line = input("> ")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if line.strip().lower() == "q":
+            break
+        print(f"\n[{time.strftime('%H:%M:%S')}] Capture triggered")
+        process_capture(api_key, region)
+
+
+def main():
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    R = "\033[0m"
+
+    print(f"{BOLD}PUD - Poker Utility & Decision Engine{R}")
+    print(f"{DIM}Screenshot -> Parse -> Range Estimate -> Equity -> Best Play{R}\n")
+
+    api_key = get_api_key()
+
+    # Build equity_calc if needed
+    equity_path = os.path.join(PROJECT_ROOT, "equity_calc")
+    if not os.path.exists(equity_path):
+        import subprocess
+        print("Building equity calculator...")
+        subprocess.run(["make", "equity"], cwd=PROJECT_ROOT, check=True)
+
+    # Region selection
+    region = os.environ.get("CAPTURE_REGION", "").strip() or None
+    if not region:
+        print("No CAPTURE_REGION set. Would you like to select one? [y/N] ", end="", flush=True)
+        try:
+            choice = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = "n"
+        if choice in ("y", "yes"):
+            region = select_region()
+            if region:
+                print(f"  Region: {region}")
+                print(f"  {DIM}(Add to .env: CAPTURE_REGION={region}){R}")
+
+    # Hotkey
+    hotkey = os.environ.get("HOTKEY", "F12").strip()
+
+    run_hotkey_loop(api_key, hotkey, region)
+
+
+if __name__ == "__main__":
+    main()

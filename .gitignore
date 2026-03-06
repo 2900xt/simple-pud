@@ -1,0 +1,6 @@
+.env
+screenshots/
+poker
+equity_calc
+__pycache__/
+*.pyc
