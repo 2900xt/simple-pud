@@ -31,6 +31,7 @@ import cairo
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from screen_parser import parse_game_state, load_config
 from advisor import analyze
+from debug_overlay import debug_screenshot
 
 # Colors (r, g, b, a)
 COLOR_BG = (0.0, 0.0, 0.0, 0.55)
@@ -163,6 +164,22 @@ class PokerHUD(Gtk.Window):
         self.draw_area.queue_draw()
         return False  # don't repeat
 
+    def trigger_debug(self):
+        """Take screenshot and open debug overlay with config rectangles."""
+        def _do():
+            path = take_screenshot()
+            if path:
+                try:
+                    out = debug_screenshot(self.config, path)
+                    print(f"Debug overlay: {out}", file=sys.stderr)
+                finally:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+        threading.Thread(target=_do, daemon=True).start()
+        return False
+
     def on_draw(self, widget, cr):
         # Clear to fully transparent
         cr.set_operator(cairo.OPERATOR_SOURCE)
@@ -173,7 +190,7 @@ class PokerHUD(Gtk.Window):
         alloc = self.draw_area.get_allocation()
         pad = 10
         spacing = 4
-        bx = 12
+        bx = 50
 
         lines = []  # list of (text, r, g, b, a, size, bold)
 
@@ -288,6 +305,50 @@ class PokerHUD(Gtk.Window):
         cr.close_path()
 
 
+def start_hotkey_listener(hud):
+    """Listen for F2 (debug) and F12 (immediate capture) via evdev."""
+    try:
+        import evdev
+        from evdev import ecodes
+    except ImportError:
+        print("evdev not available - F2/F12 hotkeys disabled", file=sys.stderr)
+        return
+
+    devices = [evdev.InputDevice(p) for p in evdev.list_devices()]
+    keyboards = [d for d in devices if ecodes.EV_KEY in d.capabilities()]
+
+    if not keyboards:
+        print("No input devices for hotkeys (add yourself to input group)",
+              file=sys.stderr)
+        return
+
+    import select as sel
+
+    def listener():
+        try:
+            while True:
+                r, _, _ = sel.select(keyboards, [], [], 1.0)
+                for dev in r:
+                    for event in dev.read():
+                        if event.type != ecodes.EV_KEY or event.value != 1:
+                            continue
+                        if event.code == ecodes.KEY_F2:
+                            print("F2: debug overlay", file=sys.stderr)
+                            GLib.idle_add(hud.trigger_debug)
+                        elif event.code == ecodes.KEY_F12:
+                            print("F12: immediate capture", file=sys.stderr)
+                            hud.poll()
+        except Exception as e:
+            print(f"Hotkey listener error: {e}", file=sys.stderr)
+        finally:
+            for d in keyboards:
+                d.close()
+
+    thread = threading.Thread(target=listener, daemon=True)
+    thread.start()
+    print("Hotkeys: F2=debug overlay, F12=capture now")
+
+
 def setup_hyprland_rules():
     """Add layerrule to exclude poker-hud from screenshots."""
     try:
@@ -330,6 +391,7 @@ def main():
     print("Press Ctrl+C to stop")
 
     hud = PokerHUD(config, interval_ms=args.interval)
+    start_hotkey_listener(hud)
     try:
         Gtk.main()
     except KeyboardInterrupt:
