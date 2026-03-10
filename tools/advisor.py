@@ -21,6 +21,13 @@ import os
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gto_preflop import (
+    lookup_preflop_gto, detect_preflop_scenario, format_gto_action,
+    format_action_log, hand_to_canonical, GTO_RFI, _pos_to_opener_group,
+    GTO_FACING_RFI_3BET, GTO_FACING_RFI_CALL,
+)
+
 EQUITY_CALC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "equity_calc")
 
 # ─── Position-based range estimates ──────────────────────────────────────────
@@ -401,7 +408,9 @@ def compute_decision(equity_result, state):
 
 def analyze(state):
     """
-    Full analysis pipeline: estimate range -> calculate equity -> recommend action.
+    Full analysis pipeline.
+    - Preflop: uses GTO lookup tables for solver-based recommendations.
+    - Postflop: estimates villain range, calculates equity, recommends action.
     Returns analysis dict or None.
     """
     hero_hand = state.get("hero_hand", [])
@@ -410,29 +419,138 @@ def analyze(state):
         return None
 
     community = state.get("community_cards", [])
+    stage = state.get("stage", "preflop")
 
-    # Estimate villain range
+    # ─── Preflop: GTO table lookup ────────────────────────────────────
+    if stage == "preflop":
+        hero_pos = state.get("hero_position", "BTN").upper()
+        action_state = detect_preflop_scenario(state)
+        gto = lookup_preflop_gto(hero_hand, hero_pos, action_state)
+
+        # Also run equity for supplementary info
+        villain_range, range_explanation = estimate_villain_range(state)
+        equity_data = run_equity_calc(hero_hand, villain_range, community)
+
+        # Build GTO-based decision
+        decision = _gto_to_decision(gto, state, equity_data)
+
+        analysis = {
+            "hero_hand": hero_hand,
+            "community_cards": community,
+            "stage": stage,
+            "villain_range": villain_range,
+            "range_explanation": range_explanation,
+            "equity": equity_data,
+            "decision": decision,
+            "gto": gto,
+            "action_log": action_state.get("action_log", []),
+            "detected_scenario": action_state.get("scenario", "?"),
+        }
+        return analysis
+
+    # ─── Postflop: equity-based analysis ──────────────────────────────
     villain_range, range_explanation = estimate_villain_range(state)
-
-    # Run equity calculation
     equity_data = run_equity_calc(hero_hand, villain_range, community)
     if not equity_data:
         return None
 
-    # Compute decision
     decision = compute_decision(equity_data, state)
 
     analysis = {
         "hero_hand": hero_hand,
         "community_cards": community,
-        "stage": state.get("stage", "unknown"),
+        "stage": stage,
         "villain_range": villain_range,
         "range_explanation": range_explanation,
         "equity": equity_data,
         "decision": decision,
     }
-
     return analysis
+
+
+def _gto_to_decision(gto, state, equity_data):
+    """Convert GTO lookup result into a decision dict compatible with the HUD."""
+    actions = gto["actions"]
+    rec = gto["recommendation"]
+    freq = gto["frequency"]
+    scenario = gto["scenario"]
+    hand = gto["hand"]
+
+    pot = state.get("pot") or 0
+    current_bet = state.get("current_bet") or 0
+    hero_pos = state.get("hero_position", "BTN").upper()
+
+    hero_player = None
+    for p in state.get("players", []):
+        if p.get("position") == hero_pos:
+            hero_player = p
+            break
+
+    hero_current_bet = hero_player.get("bet", 0) if hero_player else 0
+    call_amount = max(0, current_bet - hero_current_bet)
+    hero_stack = hero_player.get("stack", 200) if hero_player else 200
+
+    hero_equity = (equity_data["equity1"] / 100.0) if equity_data else 0.0
+
+    scenario_label = {
+        "rfi": "RFI",
+        "facing_rfi": "vs Open",
+        "facing_3bet": "vs 3-Bet",
+        "facing_4bet": "vs 4-Bet",
+    }.get(scenario, scenario)
+
+    # Format the frequency breakdown
+    freq_parts = []
+    action_labels = {"raise": "Raise", "call": "Call", "fold": "Fold"}
+    for a in ["raise", "call", "fold"]:
+        f = actions.get(a, 0.0)
+        if f > 0.01:
+            freq_parts.append(f"{action_labels[a]} {f:.0%}")
+    freq_str = " | ".join(freq_parts)
+
+    # Map GTO recommendation to advisor format
+    if rec == "RAISE" and scenario == "rfi":
+        rec_label = "RAISE"
+    elif rec == "RAISE":
+        rec_label = "RAISE"
+    elif rec == "CALL":
+        rec_label = "CALL"
+    else:
+        rec_label = "FOLD"
+
+    # Determine if this is a mixed strategy
+    mixed = sum(1 for f in actions.values() if f > 0.01) > 1
+
+    if mixed:
+        reason = f"GTO {scenario_label} [{hand}]: {freq_str}"
+    else:
+        reason = f"GTO {scenario_label} [{hand}]: Pure {rec_label.lower()}"
+
+    result = {
+        "hero_equity": hero_equity * 100,
+        "pot": pot,
+        "call_amount": call_amount,
+        "hero_stack": hero_stack,
+        "ev_fold": 0,
+        "recommendation": rec_label,
+        "reason": reason,
+        "gto_actions": actions,
+        "gto_scenario": scenario_label,
+        "gto_hand": hand,
+        "gto_mixed": mixed,
+        "sizing_evs": [],
+        "raise_options": [],
+    }
+
+    if call_amount == 0:
+        result["action_type"] = "no_bet"
+    else:
+        result["action_type"] = "facing_bet"
+        pot_odds = call_amount / (pot + call_amount) if (pot + call_amount) > 0 else 0
+        result["pot_odds"] = pot_odds * 100
+        result["ev_call"] = hero_equity * (pot + call_amount) - call_amount if equity_data else 0
+
+    return result
 
 
 def print_analysis(analysis):
@@ -441,7 +559,8 @@ def print_analysis(analysis):
         return
 
     d = analysis["decision"]
-    eq = analysis["equity"]
+    eq = analysis.get("equity")
+    gto = analysis.get("gto")
 
     R = "\033[0m"   # reset
     DIM = "\033[2m"
@@ -457,13 +576,45 @@ def print_analysis(analysis):
     print(f"  Villain:   {analysis['villain_range']}")
     print(f"  {DIM}{analysis['range_explanation']}{R}")
     print(f"{'─'*58}")
-    print(f"  Equity:    {BOLD}{d['hero_equity']:.1f}%{R} ({eq['sims']} sims)")
-    print(f"  Win/Tie:   {eq['wins1']:.1f}% / {eq['ties']:.1f}%")
+
+    # ─── GTO preflop display ──────────────────────────────────────────
+    if gto:
+        hand = gto["hand"]
+        actions = gto["actions"]
+        scenario_label = d.get("gto_scenario", gto["scenario"])
+
+        print(f"  {BOLD}GTO Preflop ({scenario_label}){R}  [{hand}]")
+
+        # Show frequency bar for each action
+        action_colors = {
+            "raise": "\033[92m",  # green
+            "call":  "\033[93m",  # yellow
+            "fold":  "\033[91m",  # red
+        }
+        for action in ["raise", "call", "fold"]:
+            freq = actions.get(action, 0.0)
+            if freq > 0.01:
+                bar_len = int(freq * 30)
+                bar = "█" * bar_len + "░" * (30 - bar_len)
+                color = action_colors.get(action, "")
+                label = {"raise": "Raise", "call": "Call ", "fold": "Fold "}[action]
+                print(f"    {color}{label} {bar} {freq:5.0%}{R}")
+
+        if d.get("gto_mixed"):
+            print(f"  {DIM}Mixed strategy: randomize between actions{R}")
+
+    # ─── Equity info (supplementary for preflop, primary for postflop) ─
+    if eq:
+        print(f"{'─'*58}")
+        print(f"  Equity:    {BOLD}{d['hero_equity']:.1f}%{R} ({eq['sims']} sims)")
+        print(f"  Win/Tie:   {eq['wins1']:.1f}% / {eq['ties']:.1f}%")
 
     if d["action_type"] == "facing_bet":
         print(f"  Pot:       {d['pot']}   Call: {d['call_amount']}   Stack: {d['hero_stack']}")
-        print(f"  Pot Odds:  {d['pot_odds']:.1f}%")
-        print(f"  EV(call):  {d['ev_call']:+.1f}")
+        if d.get("pot_odds"):
+            print(f"  Pot Odds:  {d['pot_odds']:.1f}%")
+        if d.get("ev_call") is not None and not gto:
+            print(f"  EV(call):  {d['ev_call']:+.1f}")
 
         raise_opts = d.get("raise_options", [])
         if raise_opts:
@@ -476,7 +627,7 @@ def print_analysis(analysis):
     else:
         print(f"  Pot:       {d['pot']}   Stack: {d['hero_stack']}")
 
-    # Bet sizing table
+    # Bet sizing table (postflop only)
     sizing_evs = d.get("sizing_evs", [])
     if sizing_evs and d["action_type"] == "no_bet":
         print(f"{'─'*58}")
@@ -513,6 +664,7 @@ def main():
     parser.add_argument("--villain-pos", type=str, default="CO", help="Villain position")
     parser.add_argument("--hero-pos", type=str, default="BTN", help="Hero position")
     parser.add_argument("--sims", type=int, default=100000, help="Monte Carlo simulations")
+    parser.add_argument("--bb", type=float, default=1, help="Big blind size (default: 1)")
     args = parser.parse_args()
 
     if args.state_file:
@@ -524,12 +676,14 @@ def main():
         hero_hand = [hand_str[0:2], hand_str[2:4]]
         board = args.board.split() if args.board.strip() else []
         stage = {0: "preflop", 3: "flop", 4: "turn", 5: "river"}.get(len(board), "unknown")
+        bb = args.bb
         state = {
             "hero_hand": hero_hand,
             "community_cards": board,
             "stage": stage,
             "pot": args.pot,
             "current_bet": args.bet,
+            "big_blind": bb,
             "hero_position": args.hero_pos.upper(),
             "players": [
                 {"position": args.hero_pos.upper(), "stack": 200, "bet": 0, "folded": False},

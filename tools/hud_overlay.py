@@ -31,6 +31,7 @@ import cairo
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from screen_parser import parse_game_state, load_config
 from advisor import analyze
+from gto_preflop import format_action_log
 from debug_overlay import debug_screenshot
 
 # Colors (r, g, b, a)
@@ -286,7 +287,109 @@ class PokerHUD(Gtk.Window):
             PangoCairo.show_layout(cr, layout)
             cy += log.height + spacing
 
+        # ── Action log panel (right side of screen, bottom-aligned) ─
+        self._draw_action_log(cr, alloc.width, by + box_h, pad, spacing)
+
         return False
+
+    def _draw_action_log(self, cr, right_edge, anchor_bottom, pad, spacing):
+        """Draw the action log debug panel showing per-player actions.
+        right_edge is the X coordinate of the screen's right edge.
+        anchor_bottom is the Y coordinate of the bottom edge to align with."""
+        a = self.analysis
+        state = self.game_state
+        if not state:
+            return
+
+        action_log = (a or {}).get("action_log", [])
+        detected = (a or {}).get("detected_scenario", "?")
+
+        # If no action_log from GTO (postflop), build a simple one from state
+        if not action_log:
+            for p in state.get("players", []):
+                pos = p.get("position", "?")
+                bet = p.get("bet", 0) or 0
+                folded = p.get("folded", False)
+                is_hero = pos == state.get("hero_position")
+                if is_hero:
+                    action = "hero"
+                elif folded:
+                    action = "fold"
+                elif bet > 0:
+                    action = f"bet"
+                else:
+                    action = "..."
+                action_log.append({"pos": pos, "bet": bet, "action": action, "is_hero": is_hero})
+            detected = state.get("stage", "?")
+
+        # Colors for action types
+        ACTION_COLORS = {
+            "open":     (0.2, 1.0, 0.4, 1.0),   # green
+            "3bet":     (1.0, 0.5, 0.1, 1.0),    # orange
+            "4bet":     (1.0, 0.2, 0.2, 1.0),    # red
+            "limp":     (0.7, 0.7, 0.3, 1.0),    # dull yellow
+            "fold":     (0.5, 0.5, 0.5, 0.6),    # dim gray
+            "waiting":  (0.5, 0.5, 0.5, 0.5),    # dim
+            "sb_blind": (0.6, 0.6, 0.6, 0.8),    # gray
+            "bb_blind": (0.6, 0.6, 0.6, 0.8),    # gray
+            "hero":     (0.3, 0.9, 1.0, 1.0),    # cyan
+            "bet":      (0.8, 0.8, 0.2, 1.0),    # yellow
+        }
+
+        log_lines = format_action_log(action_log)
+
+        # Build layout lines: header + action entries + scenario footer
+        all_lines = []
+        # Header
+        all_lines.append(("-- Actions --", 0.8, 0.8, 0.8, 0.9, 9, True))
+
+        for text, action_type in log_lines:
+            color = ACTION_COLORS.get(action_type, (0.7, 0.7, 0.7, 0.8))
+            all_lines.append((text, *color, 9, False))
+
+        # Scenario line
+        scenario_label = {
+            "rfi": "RFI (folded to hero)",
+            "facing_rfi": "vs Open",
+            "facing_3bet": "vs 3-Bet",
+            "facing_4bet": "vs 4-Bet",
+        }.get(detected, detected)
+        all_lines.append((f"=> {scenario_label}", 0.3, 0.9, 1.0, 1.0, 9, True))
+
+        # Measure
+        layouts = []
+        total_h = 0
+        max_w = 0
+        for text, r, g, b, a_val, size, bold in all_lines:
+            layout = self._make_layout(cr, text, size=size, bold=bold)
+            _, log = layout.get_pixel_extents()
+            layouts.append((layout, log, r, g, b, a_val))
+            total_h += log.height + spacing
+            max_w = max(max_w, log.width)
+        total_h -= spacing
+
+        box_w = max_w + pad * 2
+        box_h = total_h + pad * 2
+
+        # Align bottom with the main panel's bottom edge
+        by = anchor_bottom - box_h
+
+        # Position: right-aligned, bottom-aligned
+        ax = right_edge - box_w - 12
+        by = anchor_bottom - box_h
+
+        # Background
+        cr.set_source_rgba(0, 0, 0, 0.65)
+        self._rounded_rect(cr, ax, by, box_w, box_h, 6)
+        cr.fill()
+
+        # Render
+        cy = by + pad
+        for layout, log, r, g, b, a_val in layouts:
+            cr.set_source_rgba(r, g, b, a_val)
+            cr.move_to(ax + pad, cy)
+            PangoCairo.show_layout(cr, layout)
+            cy += log.height + spacing
 
     def _make_layout(self, cr, text, size=12, bold=False):
         layout = PangoCairo.create_layout(cr)
