@@ -48,12 +48,13 @@ def crop_region(img, region):
     return img.crop((x, y, x + w, y + h))
 
 
-def ocr_text(img, psm=7):
+def ocr_text(img, psm=7, extra_config=""):
     """Run OCR on a cropped image region."""
     if pytesseract is None:
         return ""
     try:
-        return pytesseract.image_to_string(img, config=f"--psm {psm}").strip()
+        config = f"--psm {psm} {extra_config}".strip()
+        return pytesseract.image_to_string(img, config=config).strip()
     except Exception:
         return ""
 
@@ -71,42 +72,32 @@ def parse_number(text):
     return None
 
 
-def detect_suit(card_img):
-    """Detect card suit by color analysis.
+def suit_from_rgb(r, g, b):
+    """Determine suit from an RGB color sample.
 
-    PokerStars suit colors: spades=black, hearts=red, diamonds=blue, clubs=green.
+    Suit colors: spades=black, hearts=red, diamonds=blue, clubs=green.
     """
-    img_rgb = card_img.convert("RGB")
-    pixels = list(img_rgb.getdata())
-    if not pixels:
-        return None
+    brightness = (r + g + b) / 3
 
-    colored = []
-    dark_count = 0
-    for r, g, b in pixels:
-        brightness = (r + g + b) / 3
-        if brightness < 60:
-            dark_count += 1
-        elif 40 < brightness < 210:
-            colored.append((r, g, b))
+    if brightness < 10:
+        return "s"  # spades (black/dark)
 
-    if not colored:
-        if dark_count > len(pixels) * 0.15:
-            return "s"
-        return None
-
-    avg_r = sum(p[0] for p in colored) / len(colored)
-    avg_g = sum(p[1] for p in colored) / len(colored)
-    avg_b = sum(p[2] for p in colored) / len(colored)
-
-    if avg_r > avg_g * 1.3 and avg_r > avg_b * 1.3 and avg_r > 100:
+    if r > g * 1.3 and r > b * 1.3:
         return "h"  # hearts (red)
-    elif avg_g > avg_r * 1.2 and avg_g > avg_b and avg_g > 70:
+    elif g > r * 1.2 and g > b:
         return "c"  # clubs (green)
-    elif avg_b > avg_r * 1.2 and avg_b > avg_g and avg_b > 90:
+    elif b > r * 1.2 and b > g:
         return "d"  # diamonds (blue)
     else:
         return "s"  # spades (dark/neutral)
+
+
+def detect_suit_at_pixel(img, pixel_xy):
+    """Detect suit by sampling a single pixel at absolute [x, y] coordinates."""
+    rgb = img.convert("RGB")
+    x, y = pixel_xy
+    r, g, b = rgb.getpixel((x, y))
+    return suit_from_rgb(r, g, b)
 
 
 def card_present(card_img):
@@ -117,23 +108,40 @@ def card_present(card_img):
         return False
     avg = sum(pixels) / len(pixels)
     variance = sum((p - avg) ** 2 for p in pixels) / len(pixels)
-    return avg > 80 and variance > 500
+    return avg > 50 and variance > 200
 
 
-def detect_card(card_img):
-    """Detect rank and suit of a single card image. Returns e.g. 'Ah' or None."""
+def detect_card(card_img, debug=False, rank_crop_mode="top_left", suit_pixel=None, full_img=None):
+    """Detect rank and suit of a single card image. Returns e.g. 'Ah' or None.
+
+    rank_crop_mode: "top_left" for full cards (board), "left_half" for partial cards (hero).
+    suit_pixel: optional [x, y] absolute coords to sample suit color from full_img.
+    If debug=True, returns (result, debug_info) tuple instead.
+    """
+    info = {}
+
     if not card_present(card_img):
+        gray = card_img.convert("L")
+        pixels = list(gray.getdata())
+        avg = sum(pixels) / len(pixels) if pixels else 0
+        var = sum((p - avg) ** 2 for p in pixels) / len(pixels) if pixels else 0
+        info["fail"] = f"no_card(avg={avg:.0f},var={var:.0f})"
+        if debug:
+            return None, info
         return None
 
+    # Rank: OCR a crop of the card
     w, h = card_img.size
-
-    # Rank: OCR the top-left corner
-    rank_crop = card_img.crop((0, 0, max(1, int(w * 0.55)), max(1, int(h * 0.40))))
+    if rank_crop_mode == "left_half":
+        rank_crop = card_img.crop((0, 0, max(1, int(w * 0.4)), max(1, int(h * 0.6))))
+    else:
+        rank_crop = card_img.crop((0, 0, max(1, int(w * 0.4)), max(1, int(h * 0.4))))
     rank_bw = rank_crop.convert("L").point(lambda x: 0 if x < 140 else 255, "1")
-    rank_text = ocr_text(rank_bw, psm=10).upper().strip()
+    rank_text = ocr_text(rank_bw, psm=10, extra_config="-c tessedit_char_whitelist=23456789TJQKA10").upper().strip()
+    info["ocr"] = repr(rank_text)
 
     # Clean common OCR errors
-    rank_text = rank_text.replace("O", "0").replace("I", "1").replace("L", "1")
+    rank_text = rank_text.replace("O", "0").replace("I", "1").replace("L", "1").replace("C", "K").replace("@", "Q")
     rank = None
     for key, val in RANK_MAP.items():
         if key in rank_text:
@@ -143,26 +151,45 @@ def detect_card(card_img):
         rank = rank_text
 
     if not rank:
+        info["fail"] = f"no_rank(ocr={info['ocr']})"
+        if debug:
+            return None, info
         return None
 
-    # Suit: color analysis on the suit symbol area
-    suit_crop = card_img.crop((0, max(1, int(h * 0.30)), max(1, int(w * 0.65)), max(2, int(h * 0.75))))
-    suit = detect_suit(suit_crop)
+    # Suit: sample a specific pixel if configured, otherwise skip
+    if suit_pixel and full_img:
+        x, y = suit_pixel
+        r, g, b = full_img.convert("RGB").getpixel((x, y))
+        info["suit_rgb"] = f"({r},{g},{b})"
+        suit = suit_from_rgb(r, g, b)
+    else:
+        info["fail"] = f"no_suit_pixel"
+        suit = None
 
     if not suit:
+        if debug:
+            return None, info
         return None
 
-    return rank + suit
+    result = rank + suit
+    info["result"] = result
+    if debug:
+        return result, info
+    return result
 
 
-def detect_cards_in_region(img, region, num_slots):
-    """Detect cards by splitting a region into equal-width slots."""
+def detect_cards_in_region(img, region, num_slots, rank_crop_mode="top_left", suit_pixels=None):
+    """Detect cards by splitting a region into equal-width slots.
+
+    suit_pixels: optional list of [x, y] absolute coords, one per slot.
+    """
     region_img = crop_region(img, region)
     cards = []
     slot_w = region_img.size[0] // num_slots
     for i in range(num_slots):
         card_img = region_img.crop((i * slot_w, 0, (i + 1) * slot_w, region_img.size[1]))
-        card = detect_card(card_img)
+        sp = suit_pixels[i] if suit_pixels and i < len(suit_pixels) else None
+        card = detect_card(card_img, rank_crop_mode=rank_crop_mode, suit_pixel=sp, full_img=img)
         if card:
             cards.append(card)
     return cards
@@ -215,32 +242,57 @@ def assign_positions(n_seats, button_idx):
     return positions
 
 
-def parse_game_state(table_img, config):
-    """Parse a cropped table screenshot into a game state dict.
+def _has_cards(cards_img):
+    """Check if a villain's card region shows cards (not folded/empty).
 
-    table_img: PIL Image already cropped to the table region.
-    config: parsed pud_config.json (regions are relative to table).
-
-    Returns: game state dict compatible with advisor.analyze().
+    Folded players show empty felt or a dimmed/absent card area.
+    Active players have visible card backs (distinct colored rectangles).
     """
+    gray = cards_img.convert("L")
+    pixels = list(gray.getdata())
+    if not pixels:
+        return False
+    avg = sum(pixels) / len(pixels)
+    variance = sum((p - avg) ** 2 for p in pixels) / len(pixels)
+    # Card backs have moderate brightness and some contrast vs flat felt
+    # Felt is usually uniform dark; card backs have edges/patterns
+    return variance > 200 and avg > 50
+
+
+def parse_game_state(screen_img, config):
+    """Parse a screenshot into a game state dict.
+
+    screen_img: PIL Image of the full screen.
+    config: parsed pud_config.json (regions are absolute screen coordinates).
+
+    Returns: game state dict.
+    """
+    table_img = screen_img
     state = {
         "community_cards": [],
         "hero_hand": [],
-        "hero_position": config.get("hero_position", "BTN"),
+        "hero_position": "BTN",
         "pot": 0,
         "stage": "preflop",
         "players": [],
         "current_bet": 0,
-        "big_blind": config.get("big_blind", 1),
+        "big_blind": 1,
     }
 
     # Hero cards
     if config.get("hero_cards"):
-        state["hero_hand"] = detect_cards_in_region(table_img, config["hero_cards"], 2)
+        state["hero_hand"] = detect_cards_in_region(
+            table_img, config["hero_cards"], 2,
+            rank_crop_mode="left_half",
+            suit_pixels=config.get("hero_suit_pixels"),
+        )
 
     # Board cards
     if config.get("board"):
-        state["community_cards"] = detect_cards_in_region(table_img, config["board"], 5)
+        state["community_cards"] = detect_cards_in_region(
+            table_img, config["board"], 5,
+            suit_pixels=config.get("board_suit_pixels"),
+        )
 
     n_community = len(state["community_cards"])
     state["stage"] = {0: "preflop", 3: "flop", 4: "turn", 5: "river"}.get(n_community, "postflop")
@@ -286,7 +338,7 @@ def parse_game_state(table_img, config):
         pos_names = assign_positions(n_total, button_seat_idx)
         hero_position = pos_names[hero_seat_idx]
     else:
-        hero_position = config.get("hero_position", "BTN")
+        hero_position = "BTN"
         pos_names = None
 
     state["hero_position"] = hero_position
@@ -301,12 +353,19 @@ def parse_game_state(table_img, config):
 
         player = {"position": pos, "folded": False, "bet": 0, "stack": 0}
 
+        # Fold detection: check if villain's cards are visible
+        if seat.get("cards"):
+            cards_img = crop_region(table_img, seat["cards"])
+            if not _has_cards(cards_img):
+                player["folded"] = True
+
         if seat.get("stack"):
             stack_text = ocr_text(crop_region(table_img, seat["stack"]))
             stack_val = parse_number(stack_text)
             if stack_val is not None:
                 player["stack"] = stack_val
-            else:
+            elif not seat.get("cards"):
+                # No cards region configured, fall back to stack readability as fold signal
                 player["folded"] = True
 
         if seat.get("bet"):

@@ -1,13 +1,33 @@
 #!/usr/bin/env python3
 """
-PUD - Poker Utility & Decision engine.
+PUD - Poker Screen Parser.
 
-Capture -> OCR Parse -> Range Estimate -> Equity -> Best Play
+Capture -> OCR Parse -> Game State Output
 
-No LLM needed. Uses screen region config + pytesseract OCR + color analysis.
+Uses screen region config + pytesseract OCR + color analysis.
 
-First run:  ./pud --setup    (configure screen regions via slurp)
-Then:       ./pud            (start analyzing)
+Hotkeys:
+  F12 (default)  Capture & parse game state
+  F2             Debug overlay - show config rectangles on screenshot
+
+Setup:
+  ./pud --setup                       Full wizard (all regions)
+  ./pud --setup hero cards            Hero hole cards
+  ./pud --setup hero stack            Hero stack display
+  ./pud --setup hero bet              Hero bet area
+  ./pud --setup hero button           Hero dealer button area
+  ./pud --setup board                 Board (flop/turn/river)
+  ./pud --setup pot                   Pot display
+  ./pud --setup villain 3 stack       Villain seat 3 stack
+  ./pud --setup villain 3 bet         Villain seat 3 bet
+  ./pud --setup villain 3 button      Villain seat 3 button area
+  ./pud --setup villain 3 cards       Villain seat 3 cards (fold detect)
+  ./pud --setup board suits           Board suit sample pixels (5 clicks)
+  ./pud --setup hero suits            Hero suit sample pixels (2 clicks)
+  ./pud --setup show                  Show current config
+
+Run:
+  ./pud                               Start parsing
 """
 
 import json
@@ -81,6 +101,39 @@ def take_screenshot(region=None):
     return path
 
 
+def slurp_point(prompt):
+    """Use slurp to let user click a single point on screen.
+    Returns [x, y] or None.
+    """
+    print(f"  {BOLD}{prompt}{R}")
+    print(f"  {DIM}Click a point on screen...{R}")
+
+    try:
+        result = subprocess.run(
+            ["slurp", "-p"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        print("  Selection timed out.")
+        return None
+
+    if result.returncode != 0:
+        print("  Selection cancelled.")
+        return None
+
+    raw = result.stdout.strip()
+    try:
+        # slurp -p outputs "X,Y WxH\n" where W and H are 1
+        pos = raw.split()[0]
+        x, y = pos.split(",")
+        point = [int(x), int(y)]
+        print(f"  {GREEN}Got: ({x}, {y}){R}")
+        return point
+    except (ValueError, IndexError):
+        print(f"  Could not parse slurp output: {raw}")
+        return None
+
+
 def slurp_region(prompt):
     """Use slurp to let user visually select a screen region.
     Returns [x, y, w, h] or None.
@@ -115,127 +168,281 @@ def slurp_region(prompt):
         return None
 
 
-def region_to_slurp(region):
-    """Convert [x, y, w, h] to slurp/grim format 'X,Y WxH'."""
-    return f"{region[0]},{region[1]} {region[2]}x{region[3]}"
+# ─── Setup ───────────────────────────────────────────────────────────────────
+
+def select_and_store(config, key, prompt):
+    """Slurp a region and store it in config as absolute screen coordinates."""
+    region = slurp_region(prompt)
+    if not region:
+        return False
+    config[key] = region
+    return True
 
 
-def make_relative(region, table):
-    """Convert absolute screen region to table-relative coordinates."""
-    return [region[0] - table[0], region[1] - table[1], region[2], region[3]]
+def ensure_seat(config, idx):
+    """Make sure seat index exists in config."""
+    if "seats" not in config:
+        config["seats"] = []
+    while len(config["seats"]) <= idx:
+        config["seats"].append({"stack": None, "bet": None, "button": None, "cards": None})
 
 
-# ─── Setup Wizard ────────────────────────────────────────────────────────────
+def show_config(config):
+    """Print current config summary."""
+    def fmt(region):
+        if region:
+            return f"[{region[0]}, {region[1]}, {region[2]}, {region[3]}]"
+        return f"{DIM}(not set){R}"
 
-def setup_wizard():
-    from screen_parser import save_config
+    print(f"\n{BOLD}Current PUD Config (absolute screen coords){R}")
+    print(f"{'─'*50}")
+    def fmt_pixels(pixels):
+        if pixels:
+            return ", ".join(f"({p[0]},{p[1]})" for p in pixels)
+        return f"{DIM}(not set){R}"
 
-    print(f"\n{BOLD}PUD Setup - Configure Screen Regions{R}")
+    print(f"  hero_cards:       {fmt(config.get('hero_cards'))}")
+    print(f"  hero_suit_pixels: {fmt_pixels(config.get('hero_suit_pixels'))}")
+    print(f"  board:            {fmt(config.get('board'))}")
+    print(f"  board_suit_pixels:{fmt_pixels(config.get('board_suit_pixels'))}")
+    print(f"  pot:              {fmt(config.get('pot'))}")
+    print(f"  hero_stack:       {fmt(config.get('hero_stack'))}")
+    print(f"  hero_bet:         {fmt(config.get('hero_bet'))}")
+    print(f"  hero_button:      {fmt(config.get('hero_button'))}")
+    seats = config.get("seats", [])
+    if seats:
+        print(f"  {'─'*46}")
+        for i, seat in enumerate(seats):
+            stack = fmt(seat.get("stack"))
+            bet = fmt(seat.get("bet"))
+            btn = fmt(seat.get("button"))
+            cards = fmt(seat.get("cards"))
+            print(f"  villain {i+1}:    stack={stack}  bet={bet}  btn={btn}  cards={cards}")
+    else:
+        print(f"  villains:     {DIM}(none configured){R}")
+    print()
+
+
+def setup_targeted(args):
+    """Handle targeted setup: ./pud --setup <target> [sub-target]"""
+    from screen_parser import load_config, save_config
+
+    config = load_config() or {}
+
+    if not args:
+        # Full wizard
+        setup_full_wizard(config)
+        save_config(config)
+        return
+
+    target = args[0].lower()
+    rest = [a.lower() for a in args[1:]]
+
+    if target == "show":
+        show_config(config)
+        return
+
+    if target == "board":
+        if rest and rest[0] == "suits":
+            print(f"\n  {BOLD}Board suit pixels{R} - click on the suit symbol of each board card (1-5)")
+            pixels = []
+            for i in range(5):
+                p = slurp_point(f"Click suit symbol on board card {i+1}/5")
+                if not p:
+                    print(f"  {RED}Cancelled at card {i+1}.{R}")
+                    return
+                pixels.append(p)
+            config["board_suit_pixels"] = pixels
+            save_config(config)
+            print(f"  {GREEN}Board suit pixels saved.{R}")
+            return
+        select_and_store(config, "board", "Select the BOARD (flop/turn/river, all 5 slots)")
+        save_config(config)
+        return
+
+    if target == "pot":
+        select_and_store(config, "pot", "Select the POT display")
+        save_config(config)
+        return
+
+    if target == "hero":
+        if not rest:
+            print("  What to set? cards / stack / bet / button / suits")
+            print("  Example: ./pud --setup hero cards")
+            return
+
+        if rest[0] == "suits":
+            print(f"\n  {BOLD}Hero suit pixels{R} - click on the suit symbol of each hole card (1-2)")
+            pixels = []
+            for i in range(2):
+                p = slurp_point(f"Click suit symbol on hero card {i+1}/2")
+                if not p:
+                    print(f"  {RED}Cancelled at card {i+1}.{R}")
+                    return
+                pixels.append(p)
+            config["hero_suit_pixels"] = pixels
+            save_config(config)
+            print(f"  {GREEN}Hero suit pixels saved.{R}")
+            return
+
+        prop = rest[0]
+        prop_map = {
+            "cards": ("hero_cards", "Select your HERO CARDS (your 2 hole cards)"),
+            "stack": ("hero_stack", "Select your STACK display"),
+            "bet":   ("hero_bet",   "Select your BET area"),
+            "button":("hero_button","Select your DEALER BUTTON area (where D appears when you're BTN)"),
+        }
+        if prop not in prop_map:
+            print(f"  {RED}Unknown hero property: {prop}{R}")
+            print(f"  Options: {', '.join(prop_map.keys())}")
+            return
+
+        key, prompt = prop_map[prop]
+        select_and_store(config, key, prompt)
+        save_config(config)
+        return
+
+    if target == "villain":
+        if len(rest) < 2:
+            print("  Usage: ./pud --setup villain <seat#> <stack|bet|button|cards>")
+            print("  Example: ./pud --setup villain 3 stack")
+            return
+
+        try:
+            idx = int(rest[0]) - 1  # 1-indexed for user, 0-indexed internally
+        except ValueError:
+            print(f"  {RED}Invalid seat number: {rest[0]}{R}")
+            return
+
+        if idx < 0:
+            print(f"  {RED}Seat numbers start at 1.{R}")
+            return
+
+        ensure_seat(config, idx)
+        prop = rest[1]
+
+        prop_prompts = {
+            "stack":  f"Select villain {idx+1} STACK (their chip/BB count)",
+            "bet":    f"Select villain {idx+1} BET area",
+            "button": f"Select villain {idx+1} BUTTON area (where D appears at their seat)",
+            "cards":  f"Select villain {idx+1} CARDS (where their hole cards appear, for fold detection)",
+        }
+        if prop not in prop_prompts:
+            print(f"  {RED}Unknown property: {prop}{R}")
+            print(f"  Options: stack, bet, button, cards")
+            return
+
+        region = slurp_region(prop_prompts[prop])
+        if region:
+            config["seats"][idx][prop] = region
+            print(f"  {GREEN}Villain {idx+1} {prop} updated.{R}")
+
+        save_config(config)
+        return
+
+    # Unknown target
+    print(f"  {RED}Unknown target: {target}{R}")
+    print(f"  Options: hero, board, pot, villain, show")
+
+
+def setup_full_wizard(config):
+    """Full interactive wizard for all regions."""
+    print(f"\n{BOLD}PUD Setup - Full Wizard{R}")
     print("=" * 50)
-    print(f"\nMake sure your poker table is visible on screen.")
-    print(f"For each step, you'll draw a rectangle with your mouse.\n")
+    print(f"Make sure your poker table is visible on screen.")
+    print(f"All coordinates are absolute screen positions.")
+    print(f"For each step, draw a rectangle with your mouse. Press Esc to skip optional ones.\n")
 
-    config = {}
-
-    # Table region (absolute)
-    table = slurp_region("Step 1: Select the TABLE (entire poker table window)")
-    if not table:
-        print("Table region is required.")
-        sys.exit(1)
-    config["table"] = table
-
-    # All subsequent regions are selected on-screen (absolute) then stored relative to table
     steps = [
-        ("hero_cards", "Step 2: Select your HERO CARDS (your 2 hole cards)", True),
-        ("board",      "Step 3: Select the BOARD (where flop/turn/river appear, all 5 slots)", True),
-        ("pot",        "Step 4: Select the POT display (text showing pot size)", True),
-        ("hero_stack", "Step 5: Select your STACK display (your chip/BB count)", True),
-        ("hero_bet",   "Step 6: Select your BET area (where your current bet shows)", False),
-        ("hero_button","Step 7: Select your DEALER BUTTON area (where D appears when you're BTN)", False),
+        ("hero_cards",  "Select your HERO CARDS (your 2 hole cards)", True),
+        ("board",       "Select the BOARD (flop/turn/river, all 5 card slots)", True),
+        ("pot",         "Select the POT display (text showing pot size)", True),
+        ("hero_stack",  "Select your STACK display (your chip/BB count)", True),
+        ("hero_bet",    "Select your BET area (where your current bet shows)", False),
+        ("hero_button", "Select your DEALER BUTTON area (where D appears when you're BTN)", False),
     ]
 
     for key, prompt, required in steps:
         region = slurp_region(prompt)
         if region:
-            config[key] = make_relative(region, table)
+            config[key] = region
         elif required:
-            print(f"  {RED}This region is required.{R}")
-            region = slurp_region(f"  Try again: {prompt}")
-            if region:
-                config[key] = make_relative(region, table)
-            else:
-                print("  Skipping (you can edit pud_config.json later).")
-                config[key] = None
+            print(f"  {RED}Required.{R}")
+            region = slurp_region(f"Try again: {prompt}")
+            config[key] = region
         else:
             config[key] = None
-            print(f"  {DIM}Skipped (optional).{R}")
 
-    # Big blind
-    print()
-    while True:
-        try:
-            bb = input(f"  Big blind size (1 for BB format, or chip value like 100) [{BOLD}1{R}]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            bb = ""
-        config["big_blind"] = float(bb) if bb else 1.0
-        break
+    # Suit pixels
+    print(f"\n  {BOLD}Suit sample pixels{R} - click on a suit symbol on each card.")
+    print(f"  {DIM}Make sure cards are visible on the board and in your hand.{R}\n")
+
+    board_pixels = []
+    for i in range(5):
+        p = slurp_point(f"Click suit symbol on board card {i+1}/5 (Esc to skip remaining)")
+        if not p:
+            break
+        board_pixels.append(p)
+    if len(board_pixels) == 5:
+        config["board_suit_pixels"] = board_pixels
+
+    hero_pixels = []
+    for i in range(2):
+        p = slurp_point(f"Click suit symbol on hero card {i+1}/2 (Esc to skip)")
+        if not p:
+            break
+        hero_pixels.append(p)
+    if len(hero_pixels) == 2:
+        config["hero_suit_pixels"] = hero_pixels
 
     # Opponent seats
     print()
-    while True:
-        try:
-            n = input(f"  How many opponent seats to configure? [{BOLD}8{R}]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            n = ""
-        try:
-            n_seats = int(n) if n else 8
-            break
-        except ValueError:
-            print("  Enter a number.")
+    try:
+        n = input(f"  How many opponent seats? [{BOLD}8{R}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        n = ""
+    n_seats = int(n) if n else 8
 
     config["seats"] = []
     for i in range(n_seats):
         print(f"\n  {BOLD}--- Opponent {i+1}/{n_seats} ---{R}")
-
         seat = {}
-        stack = slurp_region(f"Opponent {i+1} STACK (their chip/BB count)")
-        seat["stack"] = make_relative(stack, table) if stack else None
 
-        bet = slurp_region(f"Opponent {i+1} BET area (optional, press Esc to skip)")
-        seat["bet"] = make_relative(bet, table) if bet else None
+        s = slurp_region(f"Opponent {i+1} STACK")
+        seat["stack"] = s
 
-        btn = slurp_region(f"Opponent {i+1} BUTTON area (optional, press Esc to skip)")
-        seat["button"] = make_relative(btn, table) if btn else None
+        b = slurp_region(f"Opponent {i+1} BET (Esc to skip)")
+        seat["bet"] = b
+
+        d = slurp_region(f"Opponent {i+1} BUTTON area (Esc to skip)")
+        seat["button"] = d
+
+        c = slurp_region(f"Opponent {i+1} CARDS (for fold detection, Esc to skip)")
+        seat["cards"] = c
 
         config["seats"].append(seat)
 
-    config["hero_position"] = "BTN"  # fallback if button detection fails
-
-    save_config(config)
     print(f"\n{GREEN}Config saved to: {CONFIG_PATH}{R}")
-    print(f"Run {BOLD}./pud{R} to start analyzing!")
-    print(f"{DIM}Edit {CONFIG_PATH} directly to fine-tune regions.{R}\n")
+    print(f"Run {BOLD}./pud{R} to start parsing!\n")
 
 
-# ─── Capture & Analyze ───────────────────────────────────────────────────────
+# ─── Capture & Parse ─────────────────────────────────────────────────────────
 
 def process_capture(config):
-    """Single capture -> parse -> analyze -> print."""
+    """Single capture -> parse -> print game state."""
     from PIL import Image
-    from screen_parser import parse_game_state, crop_region
+    from screen_parser import parse_game_state
 
-    # Capture the table region directly
-    table_region = config["table"]
-    path = take_screenshot(region_to_slurp(table_region))
+    path = take_screenshot()
     if not path:
         return
 
-    table_img = Image.open(path)
+    screen_img = Image.open(path)
 
     print(f"  Screenshot: {path}")
     print("  Parsing...")
 
-    state = parse_game_state(table_img, config)
+    state = parse_game_state(screen_img, config)
 
     hero = state.get("hero_hand", [])
     board = state.get("community_cards", [])
@@ -253,24 +460,23 @@ def process_capture(config):
     if state.get("hero_position"):
         print(f"  Hero pos: {state['hero_position']}")
 
-    if hero and len(hero) >= 2:
-        from advisor import analyze, print_analysis
-        analysis = analyze(state)
-        if analysis:
-            print_analysis(analysis)
+    json_path = path.replace(".png", ".json")
+    with open(json_path, "w") as f:
+        json.dump({"state": state}, f, indent=2)
+    print(f"  State saved: {json_path}")
 
-            json_path = path.replace(".png", ".json")
-            with open(json_path, "w") as f:
-                json.dump({"state": state, "analysis": {
-                    "villain_range": analysis["villain_range"],
-                    "equity": analysis["equity"],
-                    "decision": analysis["decision"],
-                }}, f, indent=2)
-    else:
-        print(f"  {YELLOW}Hero hand not detected - skipping analysis.{R}")
-        json_path = path.replace(".png", ".json")
-        with open(json_path, "w") as f:
-            json.dump({"state": state}, f, indent=2)
+
+def process_debug_overlay(config):
+    """Capture full screen and show debug overlay with config rectangles."""
+    from debug_overlay import debug_screenshot
+
+    path = take_screenshot()
+    if not path:
+        return
+
+    print(f"  Screenshot: {path}")
+    out = debug_screenshot(config, path)
+    print(f"  {GREEN}Debug overlay opened: {out}{R}")
 
 
 # ─── Main Loops ──────────────────────────────────────────────────────────────
@@ -290,6 +496,8 @@ def run_hotkey_loop(config, hotkey):
         run_terminal_loop(config)
         return
 
+    debug_key_code = ecodes.KEY_F2
+
     devices = [evdev.InputDevice(p) for p in evdev.list_devices()]
     keyboards = [d for d in devices if ecodes.EV_KEY in d.capabilities()]
 
@@ -300,19 +508,24 @@ def run_hotkey_loop(config, hotkey):
         run_terminal_loop(config)
         return
 
-    print(f"\n{BOLD}PUD ready. Press {hotkey.upper()} to analyze.{R}")
-    print("Press Ctrl+C to quit.\n")
+    print(f"\n{BOLD}PUD ready.{R}")
+    print(f"  {hotkey.upper()} = capture & parse")
+    print(f"  F2 = debug overlay")
+    print("  Ctrl+C = quit\n")
 
     try:
         while True:
             r, _, _ = sel.select(keyboards, [], [], 1.0)
             for dev in r:
                 for event in dev.read():
-                    if (event.type == ecodes.EV_KEY and
-                            event.value == 1 and
-                            event.code == key_code):
+                    if event.type != ecodes.EV_KEY or event.value != 1:
+                        continue
+                    if event.code == key_code:
                         print(f"\n[{time.strftime('%H:%M:%S')}] Capture triggered")
                         process_capture(config)
+                    elif event.code == debug_key_code:
+                        print(f"\n[{time.strftime('%H:%M:%S')}] Debug overlay triggered")
+                        process_debug_overlay(config)
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
@@ -321,28 +534,75 @@ def run_hotkey_loop(config, hotkey):
 
 
 def run_terminal_loop(config):
-    print(f"\n{BOLD}PUD ready. Press Enter to analyze, 'q' to quit.{R}\n")
+    print(f"\n{BOLD}PUD ready.{R}")
+    print(f"  Enter = capture & parse")
+    print(f"  'd' = debug overlay")
+    print(f"  'q' = quit\n")
 
     while True:
         try:
             line = input("> ")
         except (EOFError, KeyboardInterrupt):
             break
-        if line.strip().lower() == "q":
+        cmd = line.strip().lower()
+        if cmd == "q":
             break
-        print(f"\n[{time.strftime('%H:%M:%S')}] Capture triggered")
-        process_capture(config)
+        elif cmd == "d":
+            print(f"\n[{time.strftime('%H:%M:%S')}] Debug overlay triggered")
+            process_debug_overlay(config)
+        else:
+            print(f"\n[{time.strftime('%H:%M:%S')}] Capture triggered")
+            process_capture(config)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
+def print_help():
+    print(f"""{BOLD}PUD - Poker Screen Parser{R}
+
+{BOLD}Usage:{R}
+  ./pud                               Start parsing (hotkey mode)
+  ./pud --setup                       Full setup wizard
+  ./pud --setup show                  Show current config
+  ./pud --help                        Show this help
+
+{BOLD}Setup regions:{R}
+  ./pud --setup hero cards            Hero hole cards region
+  ./pud --setup hero stack            Hero stack display
+  ./pud --setup hero bet              Hero bet area
+  ./pud --setup hero button           Hero dealer button area
+  ./pud --setup board                 Board (flop/turn/river)
+  ./pud --setup pot                   Pot display
+
+{BOLD}Setup suit pixels:{R}
+  ./pud --setup board suits           Click suit symbol on each board card (5)
+  ./pud --setup hero suits            Click suit symbol on each hero card (2)
+
+{BOLD}Setup villains:{R}
+  ./pud --setup villain 3 stack       Villain seat 3 stack
+  ./pud --setup villain 3 bet         Villain seat 3 bet
+  ./pud --setup villain 3 button      Villain seat 3 button area
+  ./pud --setup villain 3 cards       Villain seat 3 cards (fold detect)
+
+{BOLD}Hotkeys (while running):{R}
+  F12                                 Capture & parse game state
+  F2                                  Debug overlay
+""")
+
+
 def main():
-    print(f"{BOLD}PUD - Poker Utility & Decision Engine{R}")
-    print(f"{DIM}Capture -> OCR Parse -> Range Estimate -> Equity -> Best Play{R}\n")
+    print(f"{BOLD}PUD - Poker Screen Parser{R}")
+    print(f"{DIM}Capture -> OCR Parse -> Game State{R}\n")
+
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print_help()
+        return
 
     if "--setup" in sys.argv:
         check_deps()
-        setup_wizard()
+        idx = sys.argv.index("--setup")
+        setup_args = sys.argv[idx + 1:]
+        setup_targeted(setup_args)
         return
 
     from screen_parser import load_config
@@ -352,11 +612,6 @@ def main():
         sys.exit(1)
 
     check_deps()
-
-    equity_path = os.path.join(PROJECT_ROOT, "equity_calc")
-    if not os.path.exists(equity_path):
-        print("Building equity calculator...")
-        subprocess.run(["make", "equity"], cwd=PROJECT_ROOT, check=True)
 
     # Load hotkey from .env (optional)
     hotkey = "F12"
