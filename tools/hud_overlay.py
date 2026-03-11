@@ -42,6 +42,33 @@ COLOR_HERO = (0.3, 0.9, 1.0, 1.0)
 COLOR_EQUITY = (1.0, 0.85, 0.0, 1.0)
 COLOR_POT = (1.0, 1.0, 1.0, 0.9)
 
+SUIT_COLORS = {
+    "h": "#ff4444",  # hearts - red
+    "d": "#4488ff",  # diamonds - blue
+    "c": "#44cc44",  # clubs - green
+    "s": "#cccccc",  # spades - white/gray
+}
+SUIT_SYMBOLS = {"h": "\u2665", "d": "\u2666", "c": "\u2663", "s": "\u2660"}
+
+
+def card_markup(card_str):
+    """Convert 'Ah' to colored Pango markup like '<span foreground="#ff4444">A♥</span>'."""
+    if len(card_str) < 2:
+        return GLib.markup_escape_text(card_str)
+    rank = card_str[:-1]
+    suit = card_str[-1]
+    color = SUIT_COLORS.get(suit, "#ffffff")
+    symbol = SUIT_SYMBOLS.get(suit, suit)
+    return f'<span foreground="{color}">{GLib.markup_escape_text(rank)}{symbol}</span>'
+
+
+def cards_markup(cards):
+    """Convert list of card strings to colored markup joined by spaces."""
+    if not cards:
+        return "?"
+    return " ".join(card_markup(c) for c in cards)
+
+
 REC_COLORS = {
     "FOLD": (1.0, 0.3, 0.3, 1.0),
     "CALL": (1.0, 0.9, 0.2, 1.0),
@@ -199,17 +226,17 @@ class PokerHUD(Gtk.Window):
         if state is None:
             lines.append(("HUD: waiting...", 0.7, 0.7, 0.7, 1, 11, False))
         else:
-            # Line 1: game state summary
-            hero = " ".join(state.get("hero_hand", [])) or "?"
-            board = " ".join(state.get("community_cards", [])) or "-"
+            # Line 1: game state summary (with colored card suits)
+            hero_markup = cards_markup(state.get("hero_hand", []))
+            board_markup = cards_markup(state.get("community_cards", []))
             pot = state.get("pot", 0)
             stage = state.get("stage", "?")
             pos = state.get("hero_position", "?")
             players = state.get("players", [])
             active = sum(1 for p in players if not p.get("folded"))
             lines.append((
-                f"{pos}  {hero}  |  {board}  |  pot:{pot}  {stage}  {active}p",
-                1, 1, 1, 0.9, 11, False
+                f"{pos}  {hero_markup}  |  {board_markup}  |  pot:{pot}  {stage}  {active}p",
+                1, 1, 1, 0.9, 11, False, True  # last arg = is_markup
             ))
 
             # Lines 2+: advisor output
@@ -262,10 +289,12 @@ class PokerHUD(Gtk.Window):
         layouts = []
         total_h = 0
         max_w = 0
-        for text, r, g, b, a, size, bold in lines:
-            layout = self._make_layout(cr, text, size=size, bold=bold)
+        for item in lines:
+            is_markup = len(item) > 7 and item[7]
+            text, r, g, b, a, size, bold = item[:7]
+            layout = self._make_layout(cr, text, size=size, bold=bold, markup=is_markup)
             _, log = layout.get_pixel_extents()
-            layouts.append((layout, log, r, g, b, a))
+            layouts.append((layout, log, r, g, b, a, is_markup))
             total_h += log.height + spacing
             max_w = max(max_w, log.width)
         total_h -= spacing  # no trailing spacing
@@ -281,7 +310,7 @@ class PokerHUD(Gtk.Window):
 
         # Render lines
         cy = by + pad
-        for layout, log, r, g, b, a in layouts:
+        for layout, log, r, g, b, a, *_ in layouts:
             cr.set_source_rgba(r, g, b, a)
             cr.move_to(bx + pad, cy)
             PangoCairo.show_layout(cr, layout)
@@ -391,12 +420,17 @@ class PokerHUD(Gtk.Window):
             PangoCairo.show_layout(cr, layout)
             cy += log.height + spacing
 
-    def _make_layout(self, cr, text, size=12, bold=False):
+    def _make_layout(self, cr, text, size=12, bold=False, markup=False):
         layout = PangoCairo.create_layout(cr)
-        layout.set_text(text, -1)
-        weight = "bold" if bold else "normal"
-        font = Pango.FontDescription(f"monospace {weight} {size}")
-        layout.set_font_description(font)
+        if markup:
+            weight = "bold" if bold else "normal"
+            wrapped = f'<span font="monospace {weight} {size}">{text}</span>'
+            layout.set_markup(wrapped, -1)
+        else:
+            layout.set_text(text, -1)
+            weight = "bold" if bold else "normal"
+            font = Pango.FontDescription(f"monospace {weight} {size}")
+            layout.set_font_description(font)
         return layout
 
     def _rounded_rect(self, cr, x, y, w, h, r):

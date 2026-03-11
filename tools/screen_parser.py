@@ -136,19 +136,30 @@ def detect_card(card_img, debug=False, rank_crop_mode="top_left", suit_pixel=Non
         rank_crop = card_img.crop((0, 0, max(1, int(w * 0.4)), max(1, int(h * 0.6))))
     else:
         rank_crop = card_img.crop((0, 0, max(1, int(w * 0.4)), max(1, int(h * 0.4))))
-    rank_bw = rank_crop.convert("L").point(lambda x: 0 if x < 100 else 255, "1")
-    rank_text = ocr_text(rank_bw, psm=10, extra_config="-c tessedit_char_whitelist=23456789TJQKA10").upper().strip()
-    info["ocr"] = repr(rank_text)
-
-    # Clean common OCR errors
-    rank_text = rank_text.replace("O", "0").replace("I", "1").replace("L", "1").replace("C", "K").replace("@", "Q").replace("B", "8")
+    rank_gray = rank_crop.convert("L")
+    ocr_whitelist = "-c tessedit_char_whitelist=23456789TJQKA10"
     rank = None
-    for key, val in RANK_MAP.items():
-        if key in rank_text:
-            rank = val
+    rank_text = ""
+
+    for thresh in (140, 110, 170):
+        rank_bw = rank_gray.point(lambda x, t=thresh: 0 if x < t else 255, "1")
+        candidate = ocr_text(rank_bw, psm=10, extra_config=ocr_whitelist).upper().strip()
+        # Clean common OCR errors
+        candidate = candidate.replace("O", "0").replace("I", "1").replace("L", "1").replace("C", "K").replace("@", "Q").replace("B", "8")
+        for key, val in RANK_MAP.items():
+            if key in candidate:
+                rank = val
+                rank_text = candidate
+                break
+        if not rank and len(candidate) == 1 and candidate in "23456789TJQKA":
+            rank = candidate
+            rank_text = candidate
+        if rank:
             break
-    if not rank and len(rank_text) == 1 and rank_text in "23456789TJQKA":
-        rank = rank_text
+        if not rank_text:
+            rank_text = candidate
+
+    info["ocr"] = repr(rank_text)
 
     if not rank:
         info["fail"] = f"no_rank(ocr={info['ocr']})"
