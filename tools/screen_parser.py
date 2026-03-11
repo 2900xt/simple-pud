@@ -136,12 +136,12 @@ def detect_card(card_img, debug=False, rank_crop_mode="top_left", suit_pixel=Non
         rank_crop = card_img.crop((0, 0, max(1, int(w * 0.4)), max(1, int(h * 0.6))))
     else:
         rank_crop = card_img.crop((0, 0, max(1, int(w * 0.4)), max(1, int(h * 0.4))))
-    rank_bw = rank_crop.convert("L").point(lambda x: 0 if x < 140 else 255, "1")
+    rank_bw = rank_crop.convert("L").point(lambda x: 0 if x < 100 else 255, "1")
     rank_text = ocr_text(rank_bw, psm=10, extra_config="-c tessedit_char_whitelist=23456789TJQKA10").upper().strip()
     info["ocr"] = repr(rank_text)
 
     # Clean common OCR errors
-    rank_text = rank_text.replace("O", "0").replace("I", "1").replace("L", "1").replace("C", "K").replace("@", "Q")
+    rank_text = rank_text.replace("O", "0").replace("I", "1").replace("L", "1").replace("C", "K").replace("@", "Q").replace("B", "8")
     rank = None
     for key, val in RANK_MAP.items():
         if key in rank_text:
